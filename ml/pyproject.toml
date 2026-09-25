@@ -32,5 +32,10 @@ packages = ["src/predictor"]
 line-length = 100
 target-version = "py312"
 
+[tool.ruff.lint]
+# Naive стенное МСК без поясов — осознанное решение по данным (ADR 0004,
+# features/v1.yaml, ловушка суффикса Z): «datetime без tzinfo» здесь не баг.
+ignore = ["DTZ"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

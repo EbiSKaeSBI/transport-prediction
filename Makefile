@@ -18,7 +18,7 @@ EMU_UNITS ?= --unit 664030:3000 --unit 794446:3000
 .PHONY: help setup ml-setup build test lint fmt clean \
         dev attach stop status layout-install \
         serve dashboard emu-extract emu-up emu-config emu-down emu-logs \
-        submission audit capture
+        submission audit ml-train ml-predict-validate capture
 
 help: ## показать список целей
 	@echo "transport-prediction — доступные команды:"
@@ -132,3 +132,18 @@ submission: ## собрать submission.csv из train/validate
 
 audit: ## аудит датасета на утечки и базовые MAE
 	python3 scripts/oracle_audit.py
+
+# ── ML-пайплайн (этап 3: CatBoost v1) ────────────────────────────────────
+
+ml-train: ## обучить CatBoost v1 на готовых датасетах (make ml-setup раз один)
+	ml/.venv/bin/python -m predictor.train \
+		--train ml/artifacts/dataset_train.parquet \
+		--holdout ml/artifacts/dataset_test.parquet \
+		--out-dir ml/artifacts
+
+ml-predict-validate: ## прогнать v1 по validate и собрать submission.csv
+	ml/.venv/bin/python -m predictor.predict \
+		--model ml/artifacts/model_v1.json \
+		--dataset ml/artifacts/dataset_validate.parquet \
+		--out ml/artifacts/predictions_validate.csv
+	python3 scripts/make_submission.py --model ml/artifacts/predictions_validate.csv
