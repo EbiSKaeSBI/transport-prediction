@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/horizon"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
 )
 
 const (
@@ -99,6 +100,21 @@ type MLClient struct {
 	rejected  uint64
 	lastErr   error
 	startedAt time.Time
+
+	// inference — окно замеров времени обращения к модели. Отдельное от
+	// латентности гейтвея: та меряет весь путь «кадр пришёл → прогноз
+	// доставлен», эта — только поход в модель. Разница между окнами и
+	// есть ответ на вопрос «мы медленные или модель».
+	inference *latency.Window
+
+	// noBatch — сервис не умеет /predict/batch. Флаг, а не отсутствие
+	// батчинга в конфигурации, потому что узнаётся в рантайме: сервис
+	// модели пишется другим разработчиком, и его готовность к батчу
+	// нельзя угадать на старте. Без флага каждый тик уходил бы в заведомо
+	// мёртвый запрос, чтобы получить тот же 404, — то есть клиент сам
+	// создавал бы нагрузку на сервис, который не сможет её обслужить
+	// никогда.
+	noBatch bool
 }
 
 // NewMLClient создаёт клиента. Пустая конфигурация допустима: клиент
@@ -134,6 +150,7 @@ func NewMLClient(cfg MLConfig) *MLClient {
 		timeout:   cfg.Timeout,
 		retries:   retries,
 		startedAt: cfg.Now(),
+		inference: latency.New(latency.DefaultWindow),
 	}
 }
 
@@ -203,19 +220,75 @@ func (c *MLClient) Predict(ctx context.Context, f horizon.Frame) Prediction {
 	return p
 }
 
-// predict — прогноз модели с проверкой контракта, автоматом отказов и
-// повторами.
+// predict — одиночный прогноз модели.
 func (c *MLClient) predict(ctx context.Context, f horizon.Frame) (Prediction, error) {
+	ps, err := c.call(ctx, 1, func(inner context.Context) ([]Prediction, error) {
+		p, err := c.attemptOne(inner, f)
+		if err != nil {
+			return nil, err
+		}
+		return []Prediction{p}, nil
+	})
+	if err != nil {
+		return Prediction{}, err
+	}
+	return ps[0], nil
+}
+
+// PredictBatch удовлетворяет Batcher.
+//
+// Батчем идёт только то, что к моменту отправки лежит в очереди целиком. Если
+// кадр один, уходит одиночный POST /predict: держать отдельный путь ради
+// одиночного кадра незачем, а заодно это делает клиент совместимым с сервисом,
+// который /predict/batch ещё не умеет.
+func (c *MLClient) PredictBatch(ctx context.Context, frames []horizon.Frame) ([]Prediction, error) {
+	switch len(frames) {
+	case 0:
+		return nil, nil
+	case 1:
+		p, err := c.predict(ctx, frames[0])
+		if err != nil {
+			return nil, err
+		}
+		return []Prediction{p}, nil
+	}
+	return c.predictMany(ctx, frames)
+}
+
+// predictMany — батчевый прогноз с проверкой контракта, автоматом отказов и
+// повторами.
+func (c *MLClient) predictMany(ctx context.Context, frames []horizon.Frame) ([]Prediction, error) {
+	if c.batchUnsupported() {
+		return nil, errNoBatch
+	}
+	return c.call(ctx, len(frames), func(inner context.Context) ([]Prediction, error) {
+		return c.attemptBatch(inner, frames)
+	})
+}
+
+// fetch — одна попытка: собрать запрос, отправить, разобрать ответ.
+type fetch func(context.Context) ([]Prediction, error)
+
+// call — общая обвязка обращения к модели: сверка контракта, автомат отказов,
+// бюджет времени и повторы. Один и тот же путь для одиночного кадра и для
+// батча: правила отказа и повтора не должны расходиться между ними, иначе
+// модель, которую перестали считать отказчивой по одному пути, продолжит
+// получать по три попытки по другому.
+//
+// n — сколько прогнозов ожидается. Проверка количества здесь, а не в
+// разборе ответа, потому что обязана защищать оба пути: одиночный ответ без
+// delta_s — это не «ноль», это отсутствие ответа.
+func (c *MLClient) call(ctx context.Context, n int, f fetch) ([]Prediction, error) {
 	now := c.cfg.Now()
 	// Сверка контракта идёт первыми: при несовпадении лучше не делать ни
 	// одного запроса прогноза, чем сделать и получить правдоподобную
 	// неправду.
 	if err := c.ensureContract(ctx, now); err != nil {
-		return Prediction{}, err
+		return nil, err
 	}
 	if !c.allow(now) {
 		c.recordRejected()
-		return Prediction{}, errBreakerOpen
+		return nil, errBreakerOpen
 	}
 
 	budget := c.timeout * budgetMultiplier
@@ -227,13 +300,43 @@ func (c *MLClient) predict(ctx context.Context, f horizon.Frame) (Prediction, er
 	inner, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
+	// Замер идёт по настоящим часам, а не по подменённым cfg.Now: те
+	// подменяют время, чтобы автомат отказов считался детерминированно, а
+	// здесь измеряется реальный сетевой круг. В замер входят и повторы:
+	// если на ответ ушло три попытки, модель была медленной трижды, и
+	// скрыть это, оставив в квантилях только последнюю, значило бы
+	// отпрятать худший случай.
+	started := time.Now()
+
 	attempts := c.retries + 1
 	var lastErr error
 	for i := range attempts {
-		p, err := c.attempt(inner, f)
+		ps, err := f(inner)
+		if err == nil && len(ps) != n {
+			// Ответ неполный или лишний. Повтор не поможет: сервис ответил
+			// и ответил неправильно, те же два запроса дадут то же самое.
+			// В автомат отказов это тоже не идёт: размыкание предназначено
+			// для недоступности, а не для рассинхронизации контракта, и
+			// разомкнутый автомат скрыл бы вторую, куда более важную
+			// неисправность. Ошибка попадает в LastErr, дальше Fallback
+			// пройдёт эти кадры по одному и увидит, что не так.
+			err = fmt.Errorf("ml: %w: получили %d прогнозов вместо %d",
+				ErrContractMismatch, len(ps), n)
+			c.noteErr(err)
+			return nil, err
+		}
 		if err == nil {
 			c.recordSuccess()
-			return p, nil
+			elapsed := time.Since(started)
+			c.inference.ObserveDuration(elapsed)
+			for i := range ps {
+				// У всех кадров батча один и тот же замер: это время одного
+				// обращения, а не отдельный ответ на каждый кадр. Приписать
+				// каждому кадру его долю от общего времени значило бы
+				// изобрести несуществующее измерение.
+				ps[i].Latency = elapsed
+			}
+			return ps, nil
 		}
 		lastErr = err
 		if !retryable(err) {
@@ -241,7 +344,7 @@ func (c *MLClient) predict(ctx context.Context, f horizon.Frame) (Prediction, er
 			// её неудачей модели незачем: автомат из-за опечатки в запросе
 			// разомкнётся и лечить будет нечем.
 			c.recordFailure(err, now)
-			return Prediction{}, err
+			return nil, err
 		}
 		if i+1 == attempts {
 			break
@@ -252,26 +355,18 @@ func (c *MLClient) predict(ctx context.Context, f horizon.Frame) (Prediction, er
 		select {
 		case <-inner.Done():
 			c.recordFailure(fmt.Errorf("%w: %w", inner.Err(), err), now)
-			return Prediction{}, fmt.Errorf("ml: %w", err)
+			return nil, fmt.Errorf("ml: %w", err)
 		case <-time.After(pause):
 		}
 	}
 	c.recordFailure(lastErr, now)
-	return Prediction{}, fmt.Errorf("ml: %w", lastErr)
+	return nil, fmt.Errorf("ml: %w", lastErr)
 }
 
-// attempt — одна попытка: собрать запрос, отправить, разобрать ответ.
-func (c *MLClient) attempt(ctx context.Context, f horizon.Frame) (Prediction, error) {
-	body, err := json.Marshal(predictRequest{
-		SampleID:     f.SampleID,
-		TRID:         f.TRID,
-		UnitID:       f.UnitID,
-		T:            f.AsOf,
-		TargetStopID: f.PrimaryStopID(),
-		HorizonS:     f.HorizonS(),
-		Ambiguous:    f.Ambiguous,
-		Features:     f.Values,
-	})
+// attemptOne — одна попытка одиночным запросом: собрать кадр, отправить,
+// разобрать ответ.
+func (c *MLClient) attemptOne(ctx context.Context, f horizon.Frame) (Prediction, error) {
+	body, err := json.Marshal(c.request(f))
 	if err != nil {
 		return Prediction{}, fmt.Errorf("ml: не собрать запрос: %w", err)
 	}
@@ -296,6 +391,119 @@ func (c *MLClient) attempt(ctx context.Context, f horizon.Frame) (Prediction, er
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&out); err != nil {
 		return Prediction{}, fmt.Errorf("ml: не разобрать ответ: %w", err)
 	}
+	return c.prediction(f, out)
+}
+
+// attemptBatch — одна попытка батчем.
+func (c *MLClient) attemptBatch(ctx context.Context, frames []horizon.Frame) ([]Prediction, error) {
+	reqs := make([]predictRequest, len(frames))
+	// Порядок кадров запоминается по sample_id, а не по позиции: ответ
+	// сопоставляется по имени кадра. Сервис вправе вернуть ответы в любом
+	// порядке — например, отсортировав по времени обработки, — и при
+	// сопоставлении по индексу прогноз одной машины приклеился бы к другой.
+	// На городской сетке это неверное время ожидания пассажира, у которого
+	// под рукой нет способа это перепроверить, поэтому цена ошибки тут
+	// выше, чем у любой другой ошибки разбора ответа.
+	index := make(map[string]int, len(frames))
+	for i, f := range frames {
+		reqs[i] = c.request(f)
+		if _, dup := index[f.SampleID]; dup {
+			return nil, fmt.Errorf("ml: %w: кадр %q повторился в батче",
+				ErrContractMismatch, f.SampleID)
+		}
+		index[f.SampleID] = i
+	}
+
+	body, err := json.Marshal(batchRequest{Frames: reqs})
+	if err != nil {
+		return nil, fmt.Errorf("ml: не собрать батч: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.url("/predict/batch"), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("ml: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ml: %w", err)
+	}
+	defer drain(resp)
+
+	if resp.StatusCode != http.StatusOK {
+		code := resp.StatusCode
+		// Отсутствие самого эндпоинта — не беда, а недостающая
+		// оптимизация: одиночный путь отвечает, и клиент продолжит
+		// работать. Помечаем один раз и больше не спрашиваем.
+		if code == http.StatusNotFound || code == http.StatusMethodNotAllowed {
+			c.markBatchUnsupported()
+		}
+		return nil, &statusError{code: code, body: snippet(resp.Body)}
+	}
+	var out batchResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("ml: не разобрать батч: %w", err)
+	}
+	return c.mapBatch(frames, index, out)
+}
+
+// mapBatch раскладывает ответы батча по кадрам.
+//
+// Несовпадение по составу — отказ, а не попытка догадаться: лишний или
+// недостающий ответ означает, что сервис посчитал не то, о чём его просили, и
+// любая догадка здесь превратится в чужое время ожидания. Fallback после
+// отказа пройдёт эти кадры по одному, где расхождение видно сразу.
+func (c *MLClient) mapBatch(frames []horizon.Frame, index map[string]int, out batchResponse) ([]Prediction, error) {
+	slots := make([]*Prediction, len(frames))
+	for _, r := range out.Predictions {
+		i, ok := index[r.SampleID]
+		if !ok {
+			return nil, fmt.Errorf("ml: %w: в ответе батча неизвестный кадр %q",
+				ErrContractMismatch, r.SampleID)
+		}
+		if slots[i] != nil {
+			return nil, fmt.Errorf("ml: %w: кадр %q в ответе батча продублирован",
+				ErrContractMismatch, r.SampleID)
+		}
+		p, err := c.prediction(frames[i], r)
+		if err != nil {
+			return nil, err
+		}
+		slots[i] = &p
+	}
+	ps := make([]Prediction, len(frames))
+	for i, p := range slots {
+		if p == nil {
+			return nil, fmt.Errorf("ml: %w: в ответе батча нет кадра %q",
+				ErrContractMismatch, frames[i].SampleID)
+		}
+		ps[i] = *p
+	}
+	return ps, nil
+}
+
+// request — тело одного кадра. Имена признаков едут вместе со значениями:
+// модель обязана разбирать кадр по именам, а не по позициям, иначе
+// перестановка признаков в Go станет молчаливой порчей данных.
+func (c *MLClient) request(f horizon.Frame) predictRequest {
+	return predictRequest{
+		SampleID:     f.SampleID,
+		TRID:         f.TRID,
+		UnitID:       f.UnitID,
+		T:            f.AsOf,
+		TargetStopID: f.PrimaryStopID(),
+		HorizonS:     f.HorizonS(),
+		Ambiguous:    f.Ambiguous,
+		Features:     f.Values,
+	}
+}
+
+// prediction — разбор одного ответа модели. Общий для одиночного запроса и
+// для каждого элемента батча: если бы правила проверки ответа жили в двух
+// местах, они разошлись бы при первой же правке одного из них.
+func (c *MLClient) prediction(f horizon.Frame, out predictResponse) (Prediction, error) {
 	// Обязательные поля проверяются указателями: нулевая добавка и
 	// отсутствующее поле — разные вещи, а без проверки модель, забывшая
 	// поле, отвечала бы уверенным «опоздания нет».
@@ -346,6 +554,11 @@ type predictRequest struct {
 
 // predictResponse — ответ POST /predict.
 type predictResponse struct {
+	// SampleID — кадр, к которому относится ответ. В одиночном ответе поле
+	// необязательно: там запрос и ответ один, и кадр известен на стороне
+	// клиента. В батче оно обязательно и служит ключом сопоставления —
+	// без него порядок ответов пришлось бы угадывать.
+	SampleID string `json:"sample_id,omitempty"`
 	// DeltaS — добавка к cur_dev_s в секундах. Именно её предстоит
 	// выучить: метка organizers это predict_cur_dev_s, а cur_dev_s в неё
 	// входит, поэтому модель учится на разнице, а не на отклонении.
@@ -355,6 +568,22 @@ type predictResponse struct {
 	// ModelVersion — версия модели. Пустая допустима: версия нужна для
 	// разбора инцидентов, но её отсутствие прогнозу не мешает.
 	ModelVersion string `json:"model_version"`
+}
+
+// batchRequest — тело POST /predict/batch.
+//
+// Форма кадра здесь ровно та же, что и в одиночном predictRequest. Отдельная
+// схема для батча была бы вторым местом, где живёт описание признаков, и
+// рано или поздно две схемы разошлись бы: в одном наборе появился бы признак,
+// а в другом нет, и расхождение поймал бы только model/info, уже после того
+// как прогнозы поехали бы мимо.
+type batchRequest struct {
+	Frames []predictRequest `json:"frames"`
+}
+
+// batchResponse — ответ POST /predict/batch.
+type batchResponse struct {
+	Predictions []predictResponse `json:"predictions"`
 }
 
 // modelInfo — ответ GET /model/info.
@@ -451,6 +680,10 @@ func duplicates(names []string) []string {
 // errBreakerOpen — автомат разомкнут, запрос не отправлен.
 var errBreakerOpen = errors.New("ml: клиент разомкнут после серии неудач")
 
+// errNoBatch — сервис модели не умеет батч. Не беда: одиночный путь работает,
+// батчинг просто выключен.
+var errNoBatch = errors.New("ml: сервис не поддерживает /predict/batch")
+
 // ensureContract сверяет имена признаков, не чаще чем раз в cooldown: иначе
 // каждый кадр при недоступном сервисе шёл бы ещё и за /model/info, удваивая
 // давление на модель именно тогда, когда ей тяжело.
@@ -490,6 +723,39 @@ func (c *MLClient) recordRejected() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.rejected++
+}
+
+// noteErr запоминает ошибку, не считая её неудачей модели.
+//
+// Так помечаются расхождения контракта: модель ответила, и ответ неверен —
+// это не то же самое, что модель не ответила, и автомат отказов, задуманный на
+// недоступность, разомкнулся бы на том, что лечится правкой контракта, а не
+// ожиданием. При этом молчать об ошибке нельзя: она уедет в LastErr, /readyz
+// и в лог, иначе рассинхронизация обнаружится по косвенным признакам —
+// неверным временем ожидания на линии.
+func (c *MLClient) noteErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastErr = err
+}
+
+// Inference отдаёт окно замеров обращения к модели: сколько занимал поход в
+// ml-core без учёта остального пути. Гейтвей забирает снимок в /metrics.
+func (c *MLClient) Inference() latency.Quantiles {
+	return c.inference.Snapshot()
+}
+
+// batchUnsupported — сервис уже сказал, что /predict/batch у него нет.
+func (c *MLClient) batchUnsupported() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.noBatch
+}
+
+func (c *MLClient) markBatchUnsupported() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.noBatch = true
 }
 
 // allow решает, можно ли стучаться. После серии неудач клиент молчит до
@@ -567,7 +833,12 @@ func (e *statusError) Error() string {
 // retryable отличает «попробуй ещё раз» от «не трать попытки». Повтор имеет
 // смысл на сетевых сбоях, 429 и 5xx. 4xx означает, что запрос неправильный:
 // повтор лишь добавит нагрузку на сервис, который и так отвечает ошибкой.
+// Расхождение контракта повтор не исправит тоже: сервис ответит так же
+// ровно, а ещё две попытки лишь задержат переход к поштучному пути.
 func retryable(err error) bool {
+	if errors.Is(err, ErrContractMismatch) {
+		return false
+	}
 	var se *statusError
 	if errors.As(err, &se) {
 		return se.code == http.StatusTooManyRequests || se.code >= 500

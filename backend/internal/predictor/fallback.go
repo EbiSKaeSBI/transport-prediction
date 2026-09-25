@@ -139,6 +139,39 @@ func (f *Fallback) Predict(ctx context.Context, frame horizon.Frame) Prediction 
 	return p
 }
 
+// PredictBatch обслуживает пачку кадров по той же цепочке, что и Predict, но
+// с одной попыткой вместо пачки.
+//
+// Отказ батча — не отказ модели. Планировщик отдал несколько кадров, чтобы
+// сэкономить один сетевой круг, и если сервис не умеет батч или ответил
+// невеждом, те же кадры надо обслужить по одному: терять их нельзя, потому
+// что каждый из них ждёт в очереди по-настоящему. Поэтому путь отказа не
+// сворачивается в отказ, а разворачивается обратно в поштучный Predict —
+// где кэш и baseline уже отработаны и где счётчики считаются сами.
+func (f *Fallback) PredictBatch(ctx context.Context, frames []horizon.Frame) ([]Prediction, error) {
+	if len(frames) == 0 {
+		return nil, nil
+	}
+	if b, ok := f.aware.(Batcher); ok {
+		ps, err := b.PredictBatch(ctx, frames)
+		if err == nil && len(ps) == len(frames) {
+			// Успех пачкой: счётчики заводятся сразу на всё число кадров,
+			// потому что ниже по одному они уже не считаются.
+			f.nTotal.Add(uint64(len(frames)))
+			f.nModel.Add(uint64(len(frames)))
+			for _, p := range ps {
+				f.remember(p)
+			}
+			return ps, nil
+		}
+	}
+	ps := make([]Prediction, len(frames))
+	for i, frame := range frames {
+		ps[i] = f.Predict(ctx, frame)
+	}
+	return ps, nil
+}
+
 // remember кладёт успешный прогноз в кэш.
 func (f *Fallback) remember(p Prediction) {
 	if p.SampleID == "" {

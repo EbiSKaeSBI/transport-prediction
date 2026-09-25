@@ -74,6 +74,7 @@ func runServe(args []string) error {
 	mlURL := fs.String("ml", "", "адрес сервиса модели (пусто — только baseline)")
 	mlTimeout := fs.Duration("ml-timeout", 0, "бюджет одной попытки модели (0 — умолчание)")
 	queueSize := fs.Int("queue", scheduler.DefaultQueue, "размер очереди прогнозов")
+	batchSize := fs.Int("batch", scheduler.DefaultBatch, "сколько кадров уходит в модель одним запросом (1 — поштучно)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -139,6 +140,7 @@ func runServe(args []string) error {
 		Pipeline:  cfg,
 		Predictor: pred,
 		Queue:     *queueSize,
+		Batch:     *batchSize,
 		HTTPAddr:  *httpAddr,
 		DryRun:    *dryRun,
 		Verbose:   *verbose,
@@ -199,6 +201,7 @@ type serviceOptions struct {
 	Pipeline  pipeline.Config
 	Predictor predictor.Predictor
 	Queue     int
+	Batch     int
 	HTTPAddr  string
 	DryRun    bool
 	Verbose   bool
@@ -241,6 +244,7 @@ func buildService(opts serviceOptions) (*service, error) {
 	sched := scheduler.New(scheduler.Config{
 		Predictor: opts.Predictor,
 		Queue:     opts.Queue,
+		Batch:     opts.Batch,
 		Observer: func(p predictor.Prediction) {
 			gw.Observe(p)
 		},
