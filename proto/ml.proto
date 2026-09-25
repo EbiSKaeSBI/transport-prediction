@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package predictor.v1;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/ebiskauesbi/transport-prediction/backend/internal/mlclient/pb;pb";
+
+message TelemetryPoint {
+  int64 event_time_ms = 1;
+  int64 receive_time_ms = 2;
+  uint32 unit_id = 3;
+  double latitude = 4;
+  double longitude = 5;
+  float speed_kmh = 6;
+  float course_deg = 7;
+  uint32 satellites = 8;
+  float pdop = 9;
+  bool location_valid = 10;
+}
+
+message TelemetryWindow {
+  uint32 unit_id = 1;
+  int64 window_start_ms = 2;
+  int64 window_end_ms = 3;
+  repeated TelemetryPoint points = 4;
+}
+
+message FeatureFrame {
+  string sample_id = 1;
+  uint32 unit_id = 2;
+  int64 as_of_ms = 3;
+  int32 horizon_s = 4;
+  int32 target_stop_id = 5;
+  map<string, double> values = 6;
+  TelemetryWindow window = 7;
+}
+
+message PredictRequest {
+  repeated FeatureFrame frames = 1;
+}
+
+message Prediction {
+  string sample_id = 1;
+  float predicted_delay_s = 2;
+  float delta_s = 3;
+  float p_late = 4;
+  float p_ontime = 5;
+  float p_early = 6;
+  string reason = 7;
+  float horizon_min = 8;
+  string model_version = 9;
+}
+
+message PredictResponse {
+  repeated Prediction predictions = 1;
+  int64 inference_ms = 2;
+  bool degraded = 3;
+}
+
+message ModelInfoResponse {
+  string version = 1;
+  string trained_at = 2;
+  repeated string features = 3;
+  float mae_validate_s = 4;
+  float mae_test_s = 5;
+  int32 feature_count = 6;
+}
+
+service Predictor {
+  rpc Predict(PredictRequest) returns (PredictResponse);
+  rpc PredictBatch(PredictRequest) returns (PredictResponse);
+  rpc ModelInfo(google.protobuf.Empty) returns (ModelInfoResponse);
+}

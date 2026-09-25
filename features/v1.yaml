@@ -1,0 +1,95 @@
+version: v1
+description: FEATURE CONTRACT v1. Единый контракт признаков для Go (online) и Python (train/serve).
+target:
+  name: delay_delta_s
+  formula: target_delay_s - cur_dev_s
+  unit: s
+  objective: MAE
+
+sections:
+
+  given:
+    computed_by: python
+    source: points.csv
+    features:
+      cur_dev_s: {type: float32, unit: s, nullable: false}
+      horizon_s: {type: float32, unit: s, nullable: false, min: 600, max: 900}
+      target_time_begin: {type: datetime, nullable: false}
+      target_stop_id: {type: int32, nullable: false}
+
+  schedule:
+    computed_by: go
+    features:
+      plan_travel_s: {type: float32, unit: s, nullable: true}
+      slack_s: {type: float32, unit: s, nullable: true}
+      headway_s: {type: float32, unit: s, nullable: true}
+      trip_index: {type: int32, unit: count, nullable: true}
+      is_terminal_stop: {type: bool, nullable: false}
+      manual_fill: {type: bool, nullable: false}
+
+  go_state:
+    computed_by: go
+    features:
+      speed_current: {type: float32, unit: kmh, nullable: false}
+      speed_seg_avg: {type: float32, unit: kmh, nullable: true}
+      speed_seg_max: {type: float32, unit: kmh, nullable: true}
+      dwell_current_s: {type: float32, unit: s, nullable: false}
+      dwell_last_s: {type: float32, unit: s, nullable: true}
+      distance_to_target_m: {type: float32, unit: m, nullable: true}
+      stops_remaining: {type: int32, unit: count, nullable: true}
+      heading_error_deg: {type: float32, unit: deg, nullable: true}
+      route_progress: {type: float32, unit: ratio, nullable: true, min: 0.0, max: 1.0}
+      layover_min: {type: float32, unit: min, nullable: true}
+      drift_last3_slope: {type: float32, unit: s_per_stop, nullable: true}
+      consecutive_late_stops: {type: int32, unit: count, nullable: false}
+
+  window:
+    computed_by: python
+    features:
+      speed_mean_1m: {type: float32, unit: kmh, nullable: true}
+      speed_mean_3m: {type: float32, unit: kmh, nullable: true}
+      speed_mean_5m: {type: float32, unit: kmh, nullable: true}
+      speed_mean_10m: {type: float32, unit: kmh, nullable: true}
+      zero_ratio_1m: {type: float32, unit: ratio, nullable: false}
+      zero_ratio_3m: {type: float32, unit: ratio, nullable: false}
+      zero_ratio_5m: {type: float32, unit: ratio, nullable: false}
+      zero_ratio_10m: {type: float32, unit: ratio, nullable: false}
+      speed_deficit_ratio_5m: {type: float32, unit: ratio, nullable: true}
+      dwell_p90_route_s: {type: float32, unit: s, nullable: true}
+      dwell_rolling_5m_s: {type: float32, unit: s, nullable: true}
+      trend_5: {type: float32, unit: s_per_stop, nullable: true}
+      momentum: {type: float32, unit: s_per_stop, nullable: true}
+
+  context:
+    computed_by: python
+    features:
+      hour: {type: int32, unit: h, nullable: false}
+      is_peak: {type: bool, nullable: false}
+      day_of_week: {type: int32, nullable: false}
+      n_vehicles_on_route: {type: int32, unit: count, nullable: true}
+      headway_prev_s: {type: float32, unit: s, nullable: true}
+
+  quality:
+    computed_by: go
+    features:
+      staleness_s: {type: float32, unit: s, nullable: false}
+      points_in_window: {type: int32, unit: count, nullable: false}
+      lag_s: {type: float32, unit: s, nullable: false}
+
+invariants:
+  - name: horizon_window
+    rule: 600 < horizon_s <= 900
+    test: инцидент не создаётся, если target_time_begin - T вне (T+600с; T+900с]
+  - name: no_future_leak
+    rule: только event_time <= T
+    test: перемешать строки строго после T и сравнить хеш вектора признаков
+  - name: train_serve_parity
+    rule: одна функция features() для train и serve
+    test: parquet из tsfeature -mode=replay тождественен онлайн-фичам
+
+criterion3_go_features:
+  - cur_dev_s
+  - speed_seg_avg
+  - dwell_current_s
+  - dwell_last_s
+  - distance_to_target_m
