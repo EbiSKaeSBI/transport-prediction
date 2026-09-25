@@ -18,7 +18,7 @@ EMU_UNITS ?= --unit 664030:3000 --unit 794446:3000
 .PHONY: help setup ml-setup build test lint fmt clean \
         dev attach stop status layout-install \
         serve dashboard emu-extract emu-up emu-config emu-down emu-logs \
-        submission audit ml-train ml-predict-validate capture
+        submission audit ml-train ml-predict-validate capture ml-datasets
 
 help: ## показать список целей
 	@echo "transport-prediction — доступные команды:"
@@ -134,6 +134,28 @@ audit: ## аудит датасета на утечки и базовые MAE
 	python3 scripts/oracle_audit.py
 
 # ── ML-пайплайн (этап 3: CatBoost v1) ────────────────────────────────────
+
+ml-datasets: ## собрать датасеты parquet (replay-кадры должны быть в ml/artifacts/*.jsonl)
+	# Go-реплей (make ml-replay / capture) уже выполнен — только python-склейка.
+	# Профиль скорости для speed_deficit_ratio_5m всегда из train/traffic.csv.
+	ml/.venv/bin/python -m predictor.dataset \
+		--frames ml/artifacts/features_train.jsonl \
+		--traffic train/traffic.csv --schedule train/schedule.csv \
+		--labels labels/labels_train.csv \
+		--profile train/traffic.csv \
+		--out ml/artifacts/dataset_train.parquet
+	ml/.venv/bin/python -m predictor.dataset \
+		--frames ml/artifacts/features_test.jsonl \
+		--traffic test/traffic.csv --schedule test/schedule.csv \
+		--labels labels/labels_test.csv \
+		--profile train/traffic.csv \
+		--out ml/artifacts/dataset_test.parquet
+	ml/.venv/bin/python -m predictor.dataset \
+		--frames ml/artifacts/features_validate.jsonl \
+		--traffic validate/traffic.csv --schedule validate/schedule_plan.csv \
+		--labels validate/points.csv --labels-join left \
+		--profile train/traffic.csv \
+		--out ml/artifacts/dataset_validate.parquet
 
 ml-train: ## обучить CatBoost v1 на готовых датасетах (make ml-setup раз один)
 	ml/.venv/bin/python -m predictor.train \

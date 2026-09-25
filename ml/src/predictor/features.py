@@ -11,9 +11,13 @@
   генерализуется и в v1 выступает как categorical-костыль (решение по
   тексту задачи #23, отклонение от «Дано» в §5.2 architecture.md);
 - программно отбрасываем все-null колонки (в раздаче #22 это
-  ``heading_error_deg``, ``layover_min``, ``speed_deficit_ratio_5m``,
-  ``dwell_p90_route_s``, ``trend_5``, ``n_vehicles_on_route``) — фильтр
-  общий, на случай изменений данных.
+  ``heading_error_deg``, ``layover_min``, ``n_vehicles_on_route``; фичи
+  движения #24 — ``speed_deficit_ratio_5m``, ``dwell_p90_route_s``,
+  ``trend_5``, ``momentum`` — живые в train/test-датасетах, но в
+  validate-датасете trend_5/momentum все-null (в schedule_plan.csv нет
+  фактов): в модель на train-отборе они входят, а на infer CatBoost
+  трактует их null как пропуск — ожидаемое расхождение strict/validate);
+  фильтр общий, на случай изменений данных.
 
 Функция :func:`select_features` параметризована по ``version``, чтобы v2/v3
 дособирали признаки без переписывания отбора.

@@ -141,16 +141,24 @@ def train(
     seed: int = 42,
     internal_val_groups: int = 4,
     tag: str = '',
+    exclude: list[str] | None = None,
 ) -> dict:
     """Полный прогон v1: отбор фич, обучение, метрики, сохранение артефактов.
 
     ``tag`` — суффикс имён артефактов ('' → model_v1.json/metrics_v1.json,
     'b' → model_v1b.json — вариант с hint-fallback cur_dev_s и т. п.).
+    ``exclude`` — дополнительные колонки-фичи, убираемые из списка перед
+    обучением (аблиации задачи #24: какие фичи движения тянут метрику вниз).
     """
     t0 = time.monotonic()
     train_df = pl.read_parquet(train_path).drop_nulls(TARGET)
     holdout_df = pl.read_parquet(holdout_path).drop_nulls(TARGET)
     cols, _, _ = select_features(train_df, FEATURE_VERSION)
+    if exclude:
+        bad = set(exclude) - set(cols)
+        if bad:
+            raise ValueError(f'исключить можно только фичи списка, нет в нём: {sorted(bad)}')
+        cols = [c for c in cols if c not in set(exclude)]
 
     model, internal = _train_model(
         train_df, cols,
@@ -177,6 +185,7 @@ def train(
         'tag': tag,
         'target': TARGET,
         'loss': 'MAE',
+        'excluded_features': sorted(exclude or []),
         'n_train_rows': int(train_df.height),
         'n_holdout_rows': int(holdout_df.height),
         'features': cols,
@@ -219,13 +228,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--tag', default='',
                     help="суффикс имён артефактов ('' → model_v1.json, 'b' → model_v1b.json)")
+    ap.add_argument('--exclude', default='',
+                    help='аблиация: список фич через запятую, убираемых из отбора '
+                         'перед обучением (например trend_5,momentum)')
     args = ap.parse_args(argv)
 
+    exclude = [c.strip() for c in args.exclude.split(',') if c.strip()] or None
     metrics = train(
         args.train, args.holdout, args.out_dir,
         iterations=args.iterations, depth=args.depth, lr=args.learning_rate,
-        patience=args.patience, seed=args.seed, tag=args.tag,
+        patience=args.patience, seed=args.seed, tag=args.tag, exclude=exclude,
     )
+    if exclude:
+        print(f"исключены из отбора: {', '.join(exclude)}")
     b = metrics['baseline_holdout']
     print(f"фич v1: {len(metrics['features'])} | train {metrics['n_train_rows']} строк, "
           f"holdout {metrics['n_holdout_rows']} строк | "

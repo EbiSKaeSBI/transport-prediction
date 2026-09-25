@@ -35,3 +35,19 @@ def features_validate_path() -> Path:
 def train_traffic(repo_root) -> pl.DataFrame:
     from predictor.dataset import load_traffic
     return load_traffic(repo_root / 'train' / 'traffic.csv')
+
+
+@pytest.fixture(scope='session')
+def train_schedule_path(repo_root) -> Path:
+    return repo_root / 'train' / 'schedule.csv'
+
+
+@pytest.fixture(scope='session')
+def validate_schedule_path(repo_root) -> Path:
+    return repo_root / 'validate' / 'schedule_plan.csv'
+
+
+@pytest.fixture(scope='session')
+def validate_traffic(repo_root) -> pl.DataFrame:
+    from predictor.dataset import load_traffic
+    return load_traffic(repo_root / 'validate' / 'traffic.csv')

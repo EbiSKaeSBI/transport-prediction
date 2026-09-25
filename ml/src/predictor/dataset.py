@@ -87,6 +87,47 @@ def load_traffic(path: str | Path) -> pl.DataFrame:
     return pl.read_csv(path, schema=TRAFFIC_SCHEMA)
 
 
+#: Колонки schedule-файла; time_fact_begin отсутствует в validate-плане.
+_SCHEDULE_DTYPES: dict[str, pl.DataType] = {
+    'tt_action_item_id': pl.Int64,
+    'tr_id': pl.Int64,
+    'geom': pl.Utf8,
+    'building_address': pl.Utf8,
+    'order_date': pl.Utf8,
+    'manual_fill': pl.Boolean,
+}
+
+
+def load_schedule(path: str | Path) -> pl.DataFrame:
+    """Прочитать график (train/test schedule.csv или validate schedule_plan.csv).
+
+    Времена ``time_begin``/``time_fact_begin`` в раздаче бывают в nanosecond-
+    формате ``.000000000`` (train) и секундном (test) — парсим срезом до
+    секунд как naive-МСК (тот же приём, что в :func:`load_labels`). В
+    ``schedule_plan.csv`` колонки ``time_fact_begin`` нет — она добавляется
+    пустой (все null): trend_5/momentum для этого сплита заведомо null
+    (ожидаемое расхождение strict/validate, см. :mod:`predictor.window`).
+    """
+    raw = pl.read_csv(path, schema_overrides=_SCHEDULE_DTYPES)
+    if {'tt_action_item_id', 'time_begin', 'tr_id', 'geom'} - set(raw.columns):
+        raise ValueError(f'{path}: нет обязательных колонок графика')
+    df = raw.with_columns(
+        pl.col('time_begin').cast(pl.Utf8).str.slice(0, 19).str.to_datetime().alias('time_begin'),
+    )
+    if 'time_fact_begin' in df.columns:
+        df = df.with_columns(
+            pl.col('time_fact_begin').cast(pl.Utf8).str.slice(0, 19)
+            .str.to_datetime(strict=False).alias('time_fact_begin')
+        )
+    else:
+        df = df.with_columns(
+            pl.lit(None, dtype=pl.Datetime('us')).alias('time_fact_begin')
+        )
+    return df.select(
+        'tt_action_item_id', 'time_begin', 'time_fact_begin', 'tr_id', 'geom', 'manual_fill'
+    )
+
+
 def load_labels(path: str | Path) -> pl.DataFrame:
     """Прочитать файл меток/подсказок по sample_id.
 
@@ -138,6 +179,16 @@ def _dataset_column_order() -> list[str]:
     return order
 
 
+def _default_schedule_path(traffic_path: str | Path) -> Path | None:
+    """Соседний график того же сплита: schedule.csv, для validate — schedule_plan.csv."""
+    d = Path(traffic_path).parent
+    for name in ('schedule.csv', 'schedule_plan.csv'):
+        p = d / name
+        if p.exists():
+            return p
+    return None
+
+
 def build_dataset(
     frames_path: str | Path,
     traffic_path: str | Path,
@@ -145,6 +196,10 @@ def build_dataset(
     *,
     join: str = 'inner',
     cur_dev_fallback_hint: bool = True,
+    schedule_path: str | Path | None = None,
+    profile_path: str | Path | None = None,
+    episodes_df: pl.DataFrame | None = None,
+    profile_hour_bin_h: int = 2,
 ) -> pl.DataFrame:
     """Кадры ⨝ окно/контекст ⨝ метки. ``join`` = 'inner' | 'left' (про метки).
 
@@ -155,12 +210,34 @@ def build_dataset(
     ``cur_dev_fallback_hint`` (дефолт True, вариант v1b): где Go-``cur_dev_s``
     null, подставить хинт из labels/points и пометить строку в
     ``cur_dev_from_hint``; False — строгое поведение v1 (null остаётся null).
+
+    ``schedule_path`` (фичи движения #24): график сплита для trend_5/momentum
+    и остановок dwell/профиля; None — искать schedule(.csv/_plan.csv) рядом с
+    traffic, иначе фичи null. ``profile_path`` — traffic-файл для профиля
+    скорости (для ВСЕХ фолдов передавать train/traffic.csv!); None — фичи
+    профиля null. ``episodes_df`` — предвычисленные dwell-эпизоды (см.
+    :func:`predictor.window.dwell_episodes`) для сборки нескольких фолдов без
+    пересчёта; используется только вместе с ``schedule_path``.
     """
     if join not in ('inner', 'left'):
         raise ValueError(f"join должен быть 'inner' или 'left', получено {join!r}")
     frames = load_frames(frames_path)
     traffic = load_traffic(traffic_path)
-    win = build_window_features(frames, traffic)
+    schedule_df = None
+    if schedule_path is not None and str(schedule_path).lower() in ('', 'none'):
+        schedule_df = None  # явный выключатель фич движения (без авто-поиска)
+    elif schedule_path is not None:
+        schedule_df = load_schedule(schedule_path)
+    else:
+        auto = _default_schedule_path(traffic_path)
+        if auto is not None:
+            schedule_df = load_schedule(auto)
+    profile_df = load_traffic(profile_path) if profile_path is not None else None
+    win = build_window_features(
+        frames, traffic,
+        schedule_df=schedule_df, profile_df=profile_df, episodes_df=episodes_df,
+        profile_hour_bin_h=profile_hour_bin_h,
+    )
 
     df = frames.join(win.drop('t'), on='sample_id', how='left')
     assert df.height == frames.height, 'оконные фичи потеряли кадры'
@@ -231,11 +308,34 @@ def main(argv: list[str] | None = None) -> int:
                         help='импутировать пустой cur_dev_s хинтом из labels/points '
                              'с пометкой в cur_dev_from_hint (дефолт вкл; '
                              '--no-... — строгое поведение v1)')
+    parser.add_argument('--schedule', default=None,
+                        help='график сплита (train/test/schedule.csv, '
+                             'validate/schedule_plan.csv) для trend_5/momentum и '
+                             'остановок dwell/профиля; по умолчанию — schedule.csv/'
+                             'schedule_plan.csv рядом с --traffic; none — фичи null')
+    parser.add_argument('--profile', default=None,
+                        help='traffic-файл для профиля скорости speed_deficit_ratio_5m; '
+                             'для всех фолдов должен быть train/traffic.csv (профиль '
+                             'только из train, иначе leakage через статистику); '
+                             'по умолчанию — train/traffic.csv от корня репозитория, '
+                             'если он существует; none — фича null')
+    parser.add_argument('--profile-hour-bin', type=int, default=2,
+                        help='шаг бакета часа в профиле скорости (ч, делитель 24; '
+                             '24 = без бакета по времени — аблиация #24)')
     parser.add_argument('--out', required=True, help='выходной parquet')
     args = parser.parse_args(argv)
 
+    profile_path = args.profile
+    if profile_path is None:
+        default_profile = Path('train/traffic.csv')
+        profile_path = default_profile if default_profile.exists() else None
+    elif profile_path.lower() == 'none':
+        profile_path = None
+
     df = build_dataset(args.frames, args.traffic, args.labels, join=args.labels_join,
-                       cur_dev_fallback_hint=args.cur_dev_fallback_hint)
+                       cur_dev_fallback_hint=args.cur_dev_fallback_hint,
+                       schedule_path=args.schedule, profile_path=profile_path,
+                       profile_hour_bin_h=args.profile_hour_bin)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(out)

@@ -1,7 +1,9 @@
 """Сборка датасета: CLI end-to-end на мини-фикстуре + контроль реальных артефактов.
 
 Мини-фикстура задаёт ручные ожидаемые значения оконных фич (окна, dwell-прокси,
-граница as-of) и ловушку таргета: при непустом Go-``cur_dev_s`` дельта обязана
+граница as-of), фич движения #24 (trend_5/momentum по ряду отклонений,
+dwell_p90_route_s по эпизодам у остановки, speed_deficit_ratio_5m против
+train-профиля) и ловушку таргета: при непустом Go-``cur_dev_s`` дельта обязана
 считаться с кадрового, а не меточного значения. Плюс фолбэк v1b: пустой Go
 ``cur_dev_s`` импутируется хинтом из labels с пометкой в ``cur_dev_from_hint``
 (``--no-cur-dev-fallback-hint`` — строгое поведение v1).
@@ -42,8 +44,10 @@ def mini(tmp_path: Path) -> dict[str, Path]:
     frames = tmp_path / 'frames.jsonl'
     frames.write_text('\n'.join([
         # t в кадре — наивное МСК с «Z» (ловушка Go-сериализации)
-        _frame('10001_1767665700', 10001, '2026-01-06T02:15:00Z', {'cur_dev_s': 100, 'speed_current': 0}),
-        _frame('10001_1767666000', 10001, '2026-01-06T02:20:00Z', {'cur_dev_s': 50}),
+        _frame('10001_1767665700', 10001, '2026-01-06T02:15:00Z',
+               {'cur_dev_s': 100, 'speed_current': 0, 'distance_to_target_m': 0}),
+        _frame('10001_1767666000', 10001, '2026-01-06T02:20:00Z',
+               {'cur_dev_s': 50, 'distance_to_target_m': 0}),
         _frame('10002_1767666000', 10002, '2026-01-06T02:20:00Z', {'cur_dev_s': 0}),
         # кадр БЕЗ cur_dev_s в values (null, как все validate-кадры) — под фолбэк
         _frame('10003_1767666300', 10003, '2026-01-06T02:25:00Z', {'speed_current': 10}),
@@ -51,6 +55,13 @@ def mini(tmp_path: Path) -> dict[str, Path]:
     traffic = tmp_path / 'traffic.csv'
     traffic.write_text('\n'.join([
         TRAFFIC_HEADER,
+        # dwell-эпизоды для dwell_p90_route_s (обе серии <= 02:15, все кадры их видят)
+        _traffic_row(10001, '2026-01-06 01:00:00', '0'),
+        _traffic_row(10001, '2026-01-06 01:01:00', '0'),
+        _traffic_row(10001, '2026-01-06 01:05:00', '20'),
+        _traffic_row(10001, '2026-01-06 01:20:00', '0'),
+        _traffic_row(10001, '2026-01-06 01:22:00', '0'),
+        _traffic_row(10001, '2026-01-06 01:23:00', '40'),
         _traffic_row(10001, '2026-01-06 02:10:00', '0'),
         _traffic_row(10001, '2026-01-06 02:11:00', ''),  # пустой speed -> null
         _traffic_row(10001, '2026-01-06 02:12:00', '0'),
@@ -60,6 +71,29 @@ def mini(tmp_path: Path) -> dict[str, Path]:
         _traffic_row(10001, '2026-01-06 02:20:30', '999'),  # строго в будущем для всех кадров
         _traffic_row(10002, '2026-01-06 02:19:00', '5'),
     ]) + '\n', encoding='utf-8')
+    # график tr 10001: 7 остановок, отклонения [10,20,30,40,50,5,15];
+    # 5 завершены к 02:15, все 7 — к 02:20. Остальные tr — без строк.
+    # time_begin nanosecond-формат (ловушка train/schedule.csv).
+    schedule = tmp_path / 'schedule.csv'
+    schedule.write_text(
+        'tt_action_item_id,time_begin,time_fact_begin,order_date,manual_fill,tr_id,geom,'
+        'building_address\n'
+        '11,2026-01-06 00:00:00.000000000,2026-01-06 00:00:10.000000000,2026-01-06,False,10001,'
+        'POINT (37.6 55.7),A\n'
+        '12,2026-01-06 00:01:00.000000000,2026-01-06 00:01:20.000000000,2026-01-06,False,10001,'
+        'POINT (37.6 55.7),A\n'
+        '13,2026-01-06 00:02:00.000000000,2026-01-06 00:02:30.000000000,2026-01-06,False,10001,'
+        'POINT (37.6 55.7),A\n'
+        '14,2026-01-06 00:03:00.000000000,2026-01-06 00:03:40.000000000,2026-01-06,False,10001,'
+        'POINT (37.6 55.7),A\n'
+        '53699018678,2026-01-06 00:04:00.000000000,2026-01-06 00:04:50.000000000,2026-01-06,False,'
+        '10001,POINT (37.6 55.7),A\n'
+        '16,2026-01-06 02:16:00.000000000,2026-01-06 02:16:05.000000000,2026-01-06,False,10001,'
+        'POINT (37.6 55.7),A\n'
+        '17,2026-01-06 02:18:00.000000000,2026-01-06 02:18:15.000000000,2026-01-06,False,10001,'
+        'POINT (37.6 55.7),A\n',
+        encoding='utf-8',
+    )
     labels = tmp_path / 'labels.csv'
     # cur_dev_s меток (999/555) намеренно отличается от кадра (100/50):
     # дельта обязана считаться с кадрового (ADR 0004). У 10003 метка есть,
@@ -74,7 +108,8 @@ def mini(tmp_path: Path) -> dict[str, Path]:
         '2026-01-06 02:37:00,777,400,late\n',
         encoding='utf-8',
     )
-    return {'frames': frames, 'traffic': traffic, 'labels': labels, 'dir': tmp_path}
+    return {'frames': frames, 'traffic': traffic, 'labels': labels,
+            'schedule': schedule, 'profile': traffic, 'dir': tmp_path}
 
 
 def _run_cli(mini, out_name: str, extra: list[str] | None = None) -> pl.DataFrame:
@@ -88,7 +123,7 @@ def _run_cli(mini, out_name: str, extra: list[str] | None = None) -> pl.DataFram
 
 
 def test_cli_inner_join_mini(mini):
-    ds = _run_cli(mini, 'ds.parquet')
+    ds = _run_cli(mini, 'ds.parquet', extra=['--schedule', 'none'])
     # 3-й кадр (10002) без метки выпадает при inner-склейке
     assert ds.height == 3
     assert ds.columns[:4] == ['sample_id', 'tr_id', 'unit_id', 't']
@@ -173,6 +208,93 @@ def test_cur_dev_left_join_unlabeled_no_hint(mini):
     assert r['cur_dev_from_hint'].item() == 0
     # безметочный кадр при left-склейке остаётся, но хинта у него нет
     assert r['target_delay_s'].item() is None
+
+
+# --------------------- фичи движения (#24) на мини ---------------------
+
+def _run_cli_motion(mini, out_name: str, extra: list[str] | None = None) -> pl.DataFrame:
+    """CLI с --schedule/--profile: полный набор фич движения."""
+    out = mini['dir'] / out_name
+    rc = main([
+        '--frames', str(mini['frames']), '--traffic', str(mini['traffic']),
+        '--labels', str(mini['labels']),
+        '--schedule', str(mini['schedule']), '--profile', str(mini['profile']),
+        '--out', str(out), *(extra or []),
+    ])
+    assert rc == 0
+    return pl.read_parquet(out)
+
+
+def test_motion_features_mini_manual_values(mini):
+    """trend_5/momentum/dwell_p90/deficit — ручные числа на 3-кадровой фикстуре.
+
+    График tr 10001 даёт ряд dev [10,20,30,40,50,5,15] (5 завершено к 02:15,
+    все 7 — к 02:20); dwell-эпизоды 300 с и 180 с у той же остановки;
+    профиль (тот же traffic по всем tr_id, ненулевые скорости) — бакет
+    (0 м, час 2): медиана [5,10,20,30,999] = 20 км/ч (строка 02:20:30 из
+    «будущего» в неё входит — профиль по условию задачи считается из файла
+    целиком).
+    """
+    ds = _run_cli_motion(mini, 'ds_motion.parquet', extra=['--labels-join', 'left'])
+    assert ds.height == 4
+    f1 = ds.filter(pl.col('sample_id') == '10001_1767665700')
+    # trend_5: МНК по [10,20,30,40,50] => +10 с/остановку; momentum: 50-40=10
+    assert f1['trend_5'].item() == pytest.approx(10.0, abs=1e-4)
+    assert f1['momentum'].item() == pytest.approx(10.0)
+    # dwell_p90: квантиль 0.9 (linear) по [180, 300] = 288
+    assert f1['dwell_p90_route_s'].item() == pytest.approx(288.0, abs=0.5)
+    # deficit: 1 - 0/20 = 1.0 (f1 стоит; профильный бакет (0м, 2ч))
+    assert f1['speed_deficit_ratio_5m'].item() == pytest.approx(1.0)
+    f2 = ds.filter(pl.col('sample_id') == '10001_1767666000')
+    # к 02:20 завершены все 7; tail5 = [30,40,50,5,15]:
+    # sx=10 sy=140 sxy=0*30+1*40+2*50+3*5+4*15=215 sx2=30 n=5
+    # slope=(5*215-10*140)/(5*30-100)=(1075-1400)/50=-6.5
+    assert f2['trend_5'].item() == pytest.approx(-6.5, abs=0.5)
+    # momentum = dev_7 - dev_6 (последняя разность полного ряда) = 15-5
+    assert f2['momentum'].item() == pytest.approx(10.0)
+    # dwell-эпизоды тот же набор (все завершены до 02:20) — 288
+    assert f2['dwell_p90_route_s'].item() == pytest.approx(288.0, abs=0.5)
+    # deficit f2: 1 - 20/20 = 0.0 (speed_mean_5m равен медиане профиля)
+    assert f2['speed_deficit_ratio_5m'].item() == pytest.approx(0.0, abs=0.01)
+    # tr 10002/10003: нет строк графика => trend_5/momentum null; цель та же
+    # остановка => dwell_p90 считается; deficit: f3 distance null => null
+    f3 = ds.filter(pl.col('sample_id') == '10002_1767666000')
+    assert f3['trend_5'].item() is None and f3['momentum'].item() is None
+    assert f3['dwell_p90_route_s'].item() == pytest.approx(288.0, abs=0.5)
+    assert f3['speed_deficit_ratio_5m'].item() is None
+    f4 = ds.filter(pl.col('sample_id') == '10003_1767666300')
+    assert f4['trend_5'].item() is None and f4['speed_deficit_ratio_5m'].item() is None
+
+
+def test_motion_features_without_inputs_stay_null(mini):
+    """--schedule none / без --profile: trend_5/momentum/dwell/deficit все-null (v1-поведение)."""
+    ds = _run_cli(mini, 'ds_nomotion.parquet', extra=['--schedule', 'none'])
+    for col in ('trend_5', 'momentum', 'dwell_p90_route_s', 'speed_deficit_ratio_5m'):
+        assert ds[col].null_count() == ds.height
+
+
+def test_plan_without_facts_gives_null_trend(mini):
+    """schedule_plan без time_fact_begin (ловушка validate) => trend_5/momentum null."""
+    plan = mini['dir'] / 'schedule_plan.csv'
+    plan.write_text(
+        'tt_action_item_id,time_begin,order_date,manual_fill,tr_id,geom,building_address\n'
+        '11,2026-01-06 00:00:00,2026-01-06,False,10001,POINT (37.6 55.7),A\n'
+        '53699018678,2026-01-06 00:04:00,2026-01-06,False,10001,POINT (37.6 55.7),A\n'
+        '16,2026-01-06 02:16:00,2026-01-06,False,10001,POINT (37.6 55.7),A\n',
+        encoding='utf-8',
+    )
+    out = mini['dir'] / 'ds_plan.parquet'
+    rc = main([
+        '--frames', str(mini['frames']), '--traffic', str(mini['traffic']),
+        '--labels', str(mini['labels']), '--schedule', str(plan),
+        '--profile', str(mini['profile']), '--out', str(out),
+    ])
+    assert rc == 0
+    ds = pl.read_parquet(out)
+    assert ds['trend_5'].null_count() == ds.height
+    assert ds['momentum'].null_count() == ds.height
+    # dwell/deficit считаются и на плане (эпизоды — из traffic, не из фактов)
+    assert ds['dwell_p90_route_s'].null_count() < ds.height
 
 
 # ------------------------- реальные артефакты -------------------------
