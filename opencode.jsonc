@@ -1,0 +1,15 @@
+{
+  "mcp": {
+    "repowise": {
+      "type": "local",
+      "command": [
+        "repowise",
+        "mcp",
+        ".",
+        "--transport",
+        "stdio"
+      ],
+      "enabled": true
+    }
+  }
+}
