@@ -1,10 +1,21 @@
+// Каноническое описание контракта Go ↔ Python.
+//
+// Это схема для людей, а не описание проволоки. По ADR 0002 на проволосе
+// HTTP+JSON: Go говорит через net/http, Python отдаёт JSON, который FastAPI
+// генерирует в OpenAPI сам. Ни protoc, ни buf, ни кодогенерации в проекте
+// нет — и намеренно: регенерация стала бы отдельной операцией пайплайна с
+// собственными точками отказа, а строгости контракта добавляет ровно столько же,
+// сколько даёт сверка списка имён признаков.
+//
+// Блок service здесь отсутствует намеренно: gRPC отклонён тем же ADR.
+// PredictRequest и PredictResponse — это тела POST /predict и
+// POST /predict/batch, и порядок элементов predictions не задан: клиент
+// сопоставляет ответы по sample_id (ADR 0009).
+//
+// При расхождении схемы и JSON считается, что прав этот файл.
 syntax = "proto3";
 
 package predictor.v1;
-
-import "google/protobuf/empty.proto";
-
-option go_package = "github.com/ebiskauesbi/transport-prediction/backend/internal/mlclient/pb;pb";
 
 message TelemetryPoint {
   int64 event_time_ms = 1;
@@ -67,8 +78,3 @@ message ModelInfoResponse {
   int32 feature_count = 6;
 }
 
-service Predictor {
-  rpc Predict(PredictRequest) returns (PredictResponse);
-  rpc PredictBatch(PredictRequest) returns (PredictResponse);
-  rpc ModelInfo(google.protobuf.Empty) returns (ModelInfoResponse);
-}

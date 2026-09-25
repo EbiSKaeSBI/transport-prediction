@@ -1,6 +1,6 @@
 # ADR-0008: Гейтвей, лента событий и хранение прогнозов в памяти
 
-- Статус: принято
+- Статус: принято, уточнено [ADR 0009](0009-batching-and-observability.md)
 - Дата: 2026-09-25
 - Область: `internal/gateway`, `internal/scheduler`, `cmd/transportctl/serve.go`
 - Уточняет: [ADR 0002](0002-transport-and-dependency-boundary.md), [ADR 0003](0003-state-without-postgres.md)

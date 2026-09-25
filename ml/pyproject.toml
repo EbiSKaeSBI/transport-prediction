@@ -11,8 +11,6 @@ dependencies = [
     "numpy>=2.1",
     "pyarrow>=18.0",
     "scikit-learn>=1.6",
-    "grpcio>=1.68",
-    "protobuf>=5.29",
 ]
 
 [dependency-groups]
