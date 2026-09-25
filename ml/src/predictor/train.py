@@ -1,10 +1,17 @@
 """Обучение CatBoost v1 (таргет ``target_delay_s``, loss=MAE).
 
 Ватерлайн этапа v1 по §5.1 architecture.md: абсолютный таргет
-``target_delay_s`` (дельта ``delay_delta_s`` — этап v3), CatBoostRegressor с
-loss='MAE', ранняя остановка по ВНУТРЕННЕЙ group-split валидации внутри train
+``target_delay_s``, CatBoostRegressor с loss='MAE', ранняя остановка по
+ВНУТРЕННЕЙ group-split валидации внутри train
 (:class:`sklearn.model_selection.GroupKFold` по ``tr_id`` — в test-holdout для
 ранней остановки не заглядываем вообще).
+
+Режим v3 (:option:`--target delta`): таргет ``delay_delta_s = target_delay_s −
+cur_dev_s``, а итоговое предсказание на holdout собирается как
+``cur_dev_s + delta_pred`` и скорится в абсолютных секундах — ключевой приём
+§5.1 (дельта предсказывать много легче, чем абсолют). Режим пишется в метрики
+(``target``/``target_mode``), инференс (:mod:`predictor.predict`) читает его
+оттуда и делает ту же сборку.
 
 Метрики после обучения: MAE на train (виденные модели строки), на внутренней
 валидации, на честном holdout ``dataset_test.parquet`` — и baseline
@@ -40,6 +47,8 @@ from sklearn.model_selection import GroupKFold
 from predictor.features import select_features, to_matrix
 
 TARGET = 'target_delay_s'
+#: Таргет режима v3 (§5.1 architecture.md): дельта target_delay_s − cur_dev_s.
+DELTA_TARGET = 'delay_delta_s'
 FEATURE_VERSION = 'v1'
 
 
@@ -50,6 +59,7 @@ def _mae(pred: np.ndarray, actual: np.ndarray) -> float:
 def _train_model(
     df: pl.DataFrame,
     cols: list[str],
+    target_col: str,
     *,
     iterations: int,
     depth: int,
@@ -61,10 +71,12 @@ def _train_model(
     """Групповая внутренняя валидация +CatBoost с ранней остановкой по ней.
 
     Одна контрольная грань GroupKFold по ``tr_id`` уходит в eval_set; обучение
-    идёт на остальном train. Возвращает модель и метрики внутренней оценки.
+    идёт на остальном train. Возвращает модель и метрики внутренней оценки
+    (MAE внутренней валидации — по целевой колонке ``target_col``: в
+    delta-режиме это шкала дельты, не абсолютных секунд задержки).
     """
     X = to_matrix(df, cols).to_numpy().astype(np.float64)
-    y = df[TARGET].to_numpy().astype(np.float64)
+    y = df[target_col].to_numpy().astype(np.float64)
     groups = df['tr_id'].to_numpy()
 
     # GroupKFold не перемешивает и берёт группы по порядку появления;
@@ -142,6 +154,7 @@ def train(
     internal_val_groups: int = 4,
     tag: str = '',
     exclude: list[str] | None = None,
+    target_mode: str = 'abs',
 ) -> dict:
     """Полный прогон v1: отбор фич, обучение, метрики, сохранение артефактов.
 
@@ -149,10 +162,18 @@ def train(
     'b' → model_v1b.json — вариант с hint-fallback cur_dev_s и т. п.).
     ``exclude`` — дополнительные колонки-фичи, убираемые из списка перед
     обучением (аблиации задачи #24: какие фичи движения тянут метрику вниз).
+    ``target_mode`` — 'abs' (таргет ``target_delay_s``, дефолт, обратная
+    совместимость v1/v1b/v2) или 'delta' (таргет ``delay_delta_s``, §5.1
+    architecture.md этап v3): модель учит дельту, итоговое предсказание на
+    holdout собирается как ``cur_dev_s + delta_pred`` и в таком виде
+    сравнивается с abs-baseline ``cur_dev_s`` на той же выборке.
     """
+    if target_mode not in ('abs', 'delta'):
+        raise ValueError(f"неизвестный режим таргета {target_mode!r}, есть abs/delta")
+    target_col = TARGET if target_mode == 'abs' else DELTA_TARGET
     t0 = time.monotonic()
-    train_df = pl.read_parquet(train_path).drop_nulls(TARGET)
-    holdout_df = pl.read_parquet(holdout_path).drop_nulls(TARGET)
+    train_df = pl.read_parquet(train_path).drop_nulls(target_col)
+    holdout_df = pl.read_parquet(holdout_path).drop_nulls(target_col)
     cols, _, _ = select_features(train_df, FEATURE_VERSION)
     if exclude:
         bad = set(exclude) - set(cols)
@@ -161,14 +182,30 @@ def train(
         cols = [c for c in cols if c not in set(exclude)]
 
     model, internal = _train_model(
-        train_df, cols,
+        train_df, cols, target_col,
         iterations=iterations, depth=depth, lr=lr, seed=seed,
         patience=patience, internal_val_groups=internal_val_groups,
     )
 
     Xh = to_matrix(holdout_df, cols).to_numpy().astype(np.float64)
     yh = holdout_df[TARGET].to_numpy().astype(np.float64)
-    ph = model.predict(Xh)
+    raw = model.predict(Xh)
+    ph = raw
+    delta_extra: dict = {}
+    if target_mode == 'delta':
+        # §5.1: prediction = cur_dev_s + delta_pred. cur_dev_s в train/test
+        # без null (hint-fallback ADR-0007) — null здесь означал бы рассинхрон
+        # конвейера, предсказывать «дельту к неизвестной базе» отказываемся.
+        cur_h = holdout_df['cur_dev_s'].to_numpy().astype(np.float64)
+        n_cur_null = int(np.isnan(cur_h).sum())
+        if n_cur_null:
+            raise ValueError(
+                f'delta-режим: holdout {holdout_path}: cur_dev_s null в {n_cur_null} '
+                'строках — сборка cur_dev+delta невозможна (см. ADR-0007)'
+            )
+        ph = cur_h + raw
+        # дельта-модель сама по себе (без cur_dev) — для диагностики разброса
+        delta_extra['mae_holdout_delta_only'] = _mae(raw, yh - cur_h)
 
     importance = sorted(
         zip(cols, model.feature_importances_), key=lambda p: -p[1]
@@ -183,7 +220,8 @@ def train(
     metrics: dict = {
         'version': FEATURE_VERSION,
         'tag': tag,
-        'target': TARGET,
+        'target': target_col,
+        'target_mode': target_mode,
         'loss': 'MAE',
         'excluded_features': sorted(exclude or []),
         'n_train_rows': int(train_df.height),
@@ -200,6 +238,7 @@ def train(
         'mae_holdout_model': _mae(ph, yh),
         'n_holdout_pred_nan': int((~np.isfinite(ph)).sum()),
         'baseline_holdout': _baseline_metrics(holdout_df, ph, yh),
+        **delta_extra,
         **hint_diag,
         'feature_importances': {name: float(v) for name, v in importance},
         'train_seconds': round(time.monotonic() - t0, 1),
@@ -231,6 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--exclude', default='',
                     help='аблиация: список фич через запятую, убираемых из отбора '
                          'перед обучением (например trend_5,momentum)')
+    ap.add_argument('--target', choices=('abs', 'delta'), default='abs',
+                    help="таргет: 'abs' — target_delay_s (дефолт, v1/v1b/v2), "
+                         "'delta' — delay_delta_s, предсказание = "
+                         'cur_dev_s + дельта (v3, §5.1 architecture.md)')
     args = ap.parse_args(argv)
 
     exclude = [c.strip() for c in args.exclude.split(',') if c.strip()] or None
@@ -238,16 +281,22 @@ def main(argv: list[str] | None = None) -> int:
         args.train, args.holdout, args.out_dir,
         iterations=args.iterations, depth=args.depth, lr=args.learning_rate,
         patience=args.patience, seed=args.seed, tag=args.tag, exclude=exclude,
+        target_mode=args.target,
     )
     if exclude:
         print(f"исключены из отбора: {', '.join(exclude)}")
     b = metrics['baseline_holdout']
+    mode_note = (f" | таргет {metrics['target']} (delta: pred = cur_dev_s + дельта)"
+                 if args.target == 'delta' else '')
     print(f"фич v1: {len(metrics['features'])} | train {metrics['n_train_rows']} строк, "
           f"holdout {metrics['n_holdout_rows']} строк | "
-          f"лучшая итерация {metrics['internal_validation']['best_iteration']}")
+          f"лучшая итерация {metrics['internal_validation']['best_iteration']}{mode_note}")
     print(f"MAE train(все строки)   : {metrics['mae_train_all']:.2f} с")
     print(f"MAE internal val (группа): {metrics['internal_validation']['mae_internal_val']:.2f} с")
     print(f"MAE holdout (модель)    : {metrics['mae_holdout_model']:.2f} с")
+    if args.target == 'delta':
+        print(f"MAE holdout (чистая дельта, pred=delta): "
+              f"{metrics['mae_holdout_delta_only']:.2f} с")
     print(f"MAE holdout baseline cur_dev_s: nan→0 {b['mae_nan_to_zero']:.2f} с | "
           f"пропуск nan {b['mae_skip_nan']:.2f} с | та же выборка {b['mae_same_subset']:.2f} с")
     print(f"модель обыграла baseline на holdout: "

@@ -12,6 +12,9 @@ SESSION := tpredict
 LAYOUT  := tpredict
 # юниты для конфига эмулятора (id:интервал_мс), id взяты из train/traffic.csv
 EMU_UNITS ?= --unit 664030:3000 --unit 794446:3000
+# таргет обучения predictor: abs — target_delay_s (v1/v1b/v2), delta —
+# delay_delta_s + сборка cur_dev+дельта (v3, §5.1 architecture.md)
+ML_TARGET ?= abs
 
 .DEFAULT_GOAL := help
 
@@ -157,11 +160,12 @@ ml-datasets: ## собрать датасеты parquet (replay-кадры до�
 		--profile train/traffic.csv \
 		--out ml/artifacts/dataset_validate.parquet
 
-ml-train: ## обучить CatBoost v1 на готовых датасетах (make ml-setup раз один)
+ml-train: ## обучить CatBoost на датасетах (ML_TARGET=abs|delta, по умолчанию abs)
 	ml/.venv/bin/python -m predictor.train \
 		--train ml/artifacts/dataset_train.parquet \
 		--holdout ml/artifacts/dataset_test.parquet \
-		--out-dir ml/artifacts
+		--out-dir ml/artifacts \
+		--target $(ML_TARGET)
 
 ml-predict-validate: ## прогнать v1 по validate и собрать submission.csv
 	ml/.venv/bin/python -m predictor.predict \

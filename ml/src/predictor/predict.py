@@ -15,7 +15,10 @@ CLI (от корня репозитория):
 
 Формат вывода — CSV с ``;`` и колонками ``sample_id;prediction`` по одной
 строке на каждый ``sample_id`` датасета (см. scripts/make_submission.py
-``--model``). Предсказания пустых фич CatBoost отдаёт как числа, NaN в
+``--model``). Режим таргета берётся из ``metrics_*.json`` рядом с моделью:
+для delta-моделей v3 (``target_mode='delta'``) итоговое предсказание =
+``cur_dev_s`` датасета + дельта модели (§5.1 architecture.md).
+Предсказания пустых фич CatBoost отдаёт как числа, NaN в
 выходе быть не должно; если nan всё же появился — считаем его по нулевому
 предсказанию отклонения и печатаем предупреждение (для безкадровых точек
 это безопасный дефолт).
@@ -38,21 +41,41 @@ from predictor.features import to_matrix
 MODEL_FEATURES_KEY = 'features'
 
 
-def _model_feature_names(model: CatBoostRegressor, model_path: Path) -> list[str]:
-    names = list(model.feature_names_ or [])
-    if names:
-        return names
-    # Fallback: metrics рядом с моделью — имя по суффиксу модели
-    # (model_v1b.json → metrics_v1b.json), подстраховка на историческое имя.
+def _metrics_for(model_path: Path) -> dict | None:
+    """Metrics-файл рядом с моделью (по суффиксу), подстраховка — v1.
+
+    None, если файла нет: тогда режим таргета считаем 'abs' (исторические
+    модели v1/v1b/v2 всегда учили абсолютный таргет).
+    """
     candidates = [
         model_path.with_name(model_path.stem.replace('model_', 'metrics_') + '.json'),
         model_path.with_name('metrics_v1.json'),
     ]
     for metrics in candidates:
         if metrics.exists():
-            data = json.loads(metrics.read_text(encoding='utf-8'))
-            if data.get(MODEL_FEATURES_KEY):
-                return list(data[MODEL_FEATURES_KEY])
+            return json.loads(metrics.read_text(encoding='utf-8'))
+    return None
+
+
+def _target_mode(metrics: dict | None) -> str:
+    """Режим сборки предсказания из метрик модели: 'abs' или 'delta' (v3)."""
+    if not metrics:
+        return 'abs'
+    mode = metrics.get('target_mode')
+    if mode:
+        return str(mode)
+    # историческая подстраховка: режим мог быть выведен из имени таргета
+    return 'delta' if metrics.get('target') == 'delay_delta_s' else 'abs'
+
+
+def _model_feature_names(
+    model: CatBoostRegressor, model_path: Path, metrics: dict | None
+) -> list[str]:
+    names = list(model.feature_names_ or [])
+    if names:
+        return names
+    if metrics and metrics.get(MODEL_FEATURES_KEY):
+        return list(metrics[MODEL_FEATURES_KEY])
     raise ValueError(
         f'{model_path}: в модели нет имён фич и metrics-файл рядом не найден — '
         'невозможно гарантировать состав признаков'
@@ -60,20 +83,43 @@ def _model_feature_names(model: CatBoostRegressor, model_path: Path) -> list[str
 
 
 def predict(dataset_path: str | Path, model_path: str | Path) -> pl.DataFrame:
-    """По датасету parquet -> таблица ``sample_id, prediction`` (все строки)."""
+    """По датасету parquet -> таблица ``sample_id, prediction`` (все строки).
+
+    Режим таргета читается из метрик модели: 'abs' — вывод модели и есть
+    предсказание; 'delta' (v3, §5.1) — итог собираем как
+    ``cur_dev_s + delta_pred``. Для delta-режима ``cur_dev_s`` обязан быть
+    заполнен во всех строках датасета (ADR-0007: в train/validate/test это
+    так, cur_dev_s добит хинтом — hint-fallback); null — падаем с
+    внятной ошибкой, а не молча портим submission.
+    """
     df = pl.read_parquet(dataset_path)
     model = CatBoostRegressor()
     # catboost 1.2.10 не выводит формат из расширения (.json падает с
     # "Incorrect model file descriptor") — задаём явно по суффиксу.
     fmt = 'json' if str(model_path).endswith('.json') else 'cbm'
     model.load_model(str(model_path), format=fmt)
-    cols = _model_feature_names(model, Path(model_path))
+    metrics = _metrics_for(Path(model_path))
+    cols = _model_feature_names(model, Path(model_path), metrics)
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise ValueError(f'{dataset_path}: нет фич модели: {missing}')
 
     X = to_matrix(df, cols).to_numpy().astype(np.float64)
     pred = np.asarray(model.predict(X), dtype=np.float64)
+    if _target_mode(metrics) == 'delta':
+        if 'cur_dev_s' not in df.columns:
+            raise ValueError(
+                f'{dataset_path}: модель в delta-режиме, а датасет без cur_dev_s — '
+                'сборка cur_dev_s + delta невозможна'
+            )
+        cur = df['cur_dev_s'].to_numpy().astype(np.float64)
+        n_null = int(np.isnan(cur).sum())
+        if n_null:
+            raise ValueError(
+                f'{dataset_path}: delta-режим требует cur_dev_s без null (ADR-0007), '
+                f'null в {n_null} строках'
+            )
+        pred = cur + pred
     n_nan = int((~np.isfinite(pred)).sum())
     if n_nan:
         print(f'предупреждение: {n_nan} nan-предсказаний заменены на 0', file=sys.stderr)
