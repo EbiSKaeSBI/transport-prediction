@@ -60,8 +60,12 @@ type Observation struct {
 	Satellites uint8 `json:"satellites"`
 	// BatteryMV — напряжение питания из Nav00, мВ.
 	BatteryMV int `json:"battery_mv"`
-	// Odometer — одометр в сотых долях километра: из IntSensor02, при его
-	// отсутствии из Can10.AllTrack.
+	// Odometer — одометр в сотых долях километра, берётся из Can10.AllTrack.
+	// IntSensor02.Odometer в этом поле намеренно не используется: в эталонном
+	// пакете он равен 4724 и совпадает с Nav00.Track, то есть измеряется в
+	// километрах, тогда как Can10.AllTrack равен 472400. Смешивать единицы в
+	// одном поле нельзя, поэтому источник выбран по единственной проверяемой
+	// величине — TotalKm = AllTrack/100 = 4724.00 км.
 	Odometer uint32 `json:"odometer"`
 	// TotalKm — пробег из Can10, км.
 	TotalKm float64 `json:"total_km"`
@@ -109,10 +113,12 @@ type Stats struct {
 // конкурентного вызова.
 type Observer struct {
 	out     io.Writer
-	encoder *json.Encoder
 	logger  *slog.Logger
 	now     func() time.Time
 	maxSkew time.Duration
+
+	// writeMu сериализует запись в out между горутинами соединений.
+	writeMu sync.Mutex
 
 	mu     sync.RWMutex
 	latest map[uint32]Observation
@@ -153,9 +159,6 @@ func New(out io.Writer, opts ...Option) *Observer {
 		now:     time.Now,
 		maxSkew: 5 * time.Minute,
 		latest:  make(map[uint32]Observation),
-	}
-	if out != nil {
-		o.encoder = json.NewEncoder(out)
 	}
 	for _, opt := range opts {
 		opt(o)
@@ -265,10 +268,24 @@ func (o *Observer) IsStale(observation Observation) bool {
 }
 
 func (o *Observer) write(observation Observation) {
-	if o.encoder == nil {
+	if o.out == nil {
 		return
 	}
-	if err := o.encoder.Encode(observation); err != nil {
+	// Кодирование не трогает поток и выполняется вне блокировки. Под
+	// блокировкой остаётся только Write: json.Encoder небезопасен для
+	// конкурентного вызова, а OnRealtime вызывается из горутины каждого
+	// соединения. Секция узкая, поэтому медленный диск не задерживает
+	// разбор пакетов дольше самого системного вызова.
+	line, err := json.Marshal(observation)
+	if err != nil {
+		o.logger.Warn("не удалось закодировать наблюдение", "err", err)
+		return
+	}
+	line = append(line, '\n')
+
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+	if _, err := o.out.Write(line); err != nil {
 		o.logger.Warn("не удалось записать наблюдение", "err", err)
 	}
 }
@@ -294,9 +311,8 @@ func Build(unitID uint32, cells []ndtp.Cell, receivedAt time.Time) Observation {
 		case ndtp.Can10:
 			applyCan10(&observation, payload)
 		case ndtp.IntSensor02:
-			if observation.Odometer == 0 {
-				observation.Odometer = payload.Odometer
-			}
+			// Odometer намеренно игнорируется: см. поле Observation.Odometer.
+			_ = payload.Odometer
 		case ndtp.Usi08:
 			observation.FuelLevelMM = payload.LevelMM
 			observation.Temperature = payload.Temperature

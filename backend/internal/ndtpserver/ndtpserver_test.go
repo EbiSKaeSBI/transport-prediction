@@ -831,3 +831,71 @@ func TestServerRejectsForeignServiceAfterHandshake(t *testing.T) {
 		t.Errorf("UnsupportedTypeRejects %d, ожидалась 1", snap.UnsupportedTypeRejects)
 	}
 }
+
+// Молчащий клиент не должен удерживать горутину и дескриптор бесконечно.
+// До появления HandshakeTimeout чтение первого кадра не имело срока, и
+// подключившийся молча клиент держал соединение до конца процесса.
+func TestServerClosesSilentClient(t *testing.T) {
+	ts := newTestServer(t)
+	ts.HandshakeTimeout = 100 * time.Millisecond
+	addr := ts.start(t)
+	defer ts.stop()
+
+	conn := connectDialer(t, addr)
+	defer conn.Close()
+	// Ничего не пишем: сервер обязан закрыть соединение сам.
+
+	closed := make(chan error, 1)
+	go func() {
+		_, err := conn.Read(make([]byte, 1))
+		closed <- err
+	}()
+
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("соединение должно быть закрыто сервером, а не оставаться открытым")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("сервер не закрыл молчащее соединение по HandshakeTimeout")
+	}
+
+	if snap := ts.Metrics.Snapshot(); snap.HandshakeTimeouts != 1 {
+		t.Errorf("HandshakeTimeouts %d, ожидалась 1", snap.HandshakeTimeouts)
+	}
+	// Таймаут handshake не должен выглядеть как ошибка разбора кадра.
+	if snap := ts.Metrics.Snapshot(); snap.DecodeErrors != 0 || snap.CRCErrors != 0 {
+		t.Errorf("молчание не должно считаться ошибкой разбора: decode=%d crc=%d",
+			snap.DecodeErrors, snap.CRCErrors)
+	}
+}
+
+// Остановка по отмене контекста обязана быть предсказуемой: контейнер
+// получает SIGTERM, а Serve не должен ждать соединения, которое больше не
+// пришлёт ни одного байта. Критерий 5 оценивает холодный старт и остановку.
+func TestServeStopsWithSilentConnection(t *testing.T) {
+	ts := newTestServer(t)
+	// ReadTimeout и HandshakeTimeout намеренно не заданы: обрывать чтение
+	// должна отмена контекста, а не таймаут.
+	ts.ReadTimeout = 0
+	ts.HandshakeTimeout = 0
+	addr := ts.start(t)
+
+	conn := connectDialer(t, addr)
+	defer conn.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- ts.Server.Serve(ts.listener, ts.ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+	ts.cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Serve вернул %v, ожидался nil при отмене контекста", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve не завершился: соединение не было закрыто по отмене контекста")
+	}
+}

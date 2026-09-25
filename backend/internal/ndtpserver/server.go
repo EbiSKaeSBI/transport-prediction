@@ -54,6 +54,8 @@ type Metrics struct {
 	// UnsupportedTypeRejects — отказов из-за типа пакета, не входящего в
 	// известный протоколу набор.
 	UnsupportedTypeRejects atomic.Int64
+	// HandshakeTimeouts — соединений, закрытых по истечении HandshakeTimeout.
+	HandshakeTimeouts atomic.Int64
 }
 
 // Snapshot — согласованный набор значений метрик, пригодный для экспорта.
@@ -69,6 +71,7 @@ type Snapshot struct {
 	SkippedPackets         int64 `json:"skipped_packets"`
 	EncryptedRejects       int64 `json:"encrypted_rejects"`
 	UnsupportedTypeRejects int64 `json:"unsupported_type_rejects"`
+	HandshakeTimeouts      int64 `json:"handshake_timeouts"`
 }
 
 // Snapshot читает все счётчики. Значения между полями не атомарны между
@@ -86,6 +89,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		SkippedPackets:         m.SkippedPackets.Load(),
 		EncryptedRejects:       m.EncryptedRejects.Load(),
 		UnsupportedTypeRejects: m.UnsupportedTypeRejects.Load(),
+		HandshakeTimeouts:      m.HandshakeTimeouts.Load(),
 	}
 }
 
@@ -120,7 +124,23 @@ type Server struct {
 	// ReadTimeout — таймаута чтения пакета. При значении 0 или меньше
 	// таймаут не применяется, что нужно для потоков с редкими пакетами.
 	ReadTimeout time.Duration
+	// HandshakeTimeout — таймаута чтения первого кадра. Без него клиент,
+	// установивший соединение и замолчавший, удерживает горутину и дескриптор
+	// бесконечно. При значении 0 или меньше используется HandshakeTimeoutDefault,
+	// потому что молчание в этой фазе всегда является ошибкой, а не редким
+	// пакетом.
+	HandshakeTimeout time.Duration
+
+	// conns — реестр активных соединений. Он нужен для того, чтобы отмена
+	// контекста обрывала чтение: иначе горутина соединения остаётся в Read,
+	// Serve не завершает wg.Wait, и остановка контейнера упирается в таймаут
+	// Docker вместо штатного выхода.
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
 }
+
+// HandshakeTimeoutDefault — таймаут чтения CONN_REQUEST по умолчанию.
+const HandshakeTimeoutDefault = 30 * time.Second
 
 // ListenAndServe создаёт слушатель на Addr и обслуживает соединения до
 // отмены ctx.
@@ -144,6 +164,7 @@ func (s *Server) Serve(listener net.Listener, ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		listener.Close()
+		s.closeAll()
 	}()
 
 	var wg sync.WaitGroup
@@ -169,6 +190,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	s.Metrics.Connections.Add(1)
 	s.Metrics.ActiveConns.Add(1)
 	defer s.Metrics.ActiveConns.Add(-1)
+	s.track(conn)
+	defer s.untrack(conn)
 
 	var unitID uint32
 	defer func() {
@@ -179,10 +202,34 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 
 	reader := ndtp.NewReader(conn)
 
+	// Первый кадр обязателен и ждать его можно только ограниченное время:
+	// в отличие от потока телеметрии, молчание после подключения не является
+	// нормой.
+	handshakeTimeout := s.HandshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = HandshakeTimeoutDefault
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(handshakeTimeout)); err != nil {
+		s.logger().Warn("не удалось задать таймаут handshake", "err", err, "peer", conn.RemoteAddr())
+	}
 	frame, err := reader.Next()
 	if err != nil {
+		if isTimeout(err) && ctx.Err() == nil {
+			// Отдельный счётчик: молчащий клиент — это не битый кадр,
+			// и смешивать его с ошибками разбора нельзя.
+			s.Metrics.HandshakeTimeouts.Add(1)
+			s.logger().Warn("не дождались handshake",
+				"timeout", handshakeTimeout, "peer", conn.RemoteAddr())
+			return
+		}
 		s.countParseError(err)
 		return
+	}
+	// Дальше срок ожидания задаётся ReadTimeout, если он задан.
+	if s.ReadTimeout <= 0 {
+		if err := conn.SetReadDeadline(time.Time{}); err != nil {
+			s.logger().Warn("не удалось снять таймаут handshake", "err", err, "peer", conn.RemoteAddr())
+		}
 	}
 	if err := frame.ValidateService(ndtp.ServiceGenericControls); err != nil {
 		s.Metrics.DecodeErrors.Add(1)
@@ -278,6 +325,44 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 			s.Handler.OnRealtime(unitID, frame, cells)
 		}
 	}
+}
+
+// track регистрирует соединение, чтобы отмена контекста могла прервать чтение.
+func (s *Server) track(conn net.Conn) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.conns[conn] = struct{}{}
+}
+
+// untrack снимает соединение с учёта после его закрытия.
+func (s *Server) untrack(conn net.Conn) {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	delete(s.conns, conn)
+}
+
+// closeAll обрывает все активные соединения. Вызывается при отмене
+// контекста: без этого горутины останутся в Read, и Serve не дойдёт до
+// wg.Wait.
+func (s *Server) closeAll() {
+	s.connsMu.Lock()
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.connsMu.Unlock()
+	for _, conn := range conns {
+		conn.Close()
+	}
+}
+
+// isTimeout сообщает, что ошибка чтения вызвана истечением таймаута.
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
 
 func (s *Server) countParseError(err error) {

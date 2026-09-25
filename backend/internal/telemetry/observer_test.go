@@ -304,3 +304,93 @@ func TestObserverConcurrentUse(t *testing.T) {
 		t.Errorf("Observations %d, ожидалось 1600", stats.Observations)
 	}
 }
+
+// Риск: гонка записи в JSONL. Наблюдатель вызывается из горутины каждого
+// соединения, поэтому один json.Encoder на всех давал гонку данных.
+// TestObserverConcurrentUse этот случай не покрывал, потому что создавал
+// наблюдатель с New(nil, …), то есть с отключённым выводом.
+func TestObserverConcurrentJSONLWrite(t *testing.T) {
+	_, frames := goldenFrames(t)
+	var buf syncBuffer
+	observer := New(&buf, WithLogger(quietLogger()))
+	cells := mustCells(t, frames[0])
+
+	var wg sync.WaitGroup
+	for worker := range 8 {
+		wg.Add(1)
+		go func(unit uint32) {
+			defer wg.Done()
+			for i := range 200 {
+				observer.OnRealtime(unit+uint32(i%3), frames[0], cells)
+			}
+		}(uint32(worker) * 100)
+	}
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != 1600 {
+		t.Fatalf("строк в JSONL %d, ожидалось 1600", len(lines))
+	}
+	// Без блокировки строки склеивались бы в одну: символ за символом
+	// два Write перемежались бы. Разбор каждой строки ловит это надёжнее,
+	// чем подсчёт символов.
+	for i, line := range lines {
+		var observation Observation
+		if err := json.Unmarshal([]byte(line), &observation); err != nil {
+			t.Fatalf("строка %d не разбирается, запись склеена: %v", i, err)
+		}
+	}
+}
+
+// syncBuffer — потокобезопасный буфер под concurrent-тест записи.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Единицы измерения одометра не должны смешиваться. В эталонном пакете
+// IntSensor02.Odometer равен 4724 и совпадает с Nav00.Track (километры),
+// тогда как Can10.AllTrack равен 472400 (сотые доли километра).
+func TestOdometerUnitIsConsistent(t *testing.T) {
+	_, frames := goldenFrames(t)
+	cells := mustCells(t, frames[0])
+
+	var intSensor, can10 uint32
+	var navTrack uint16
+	for _, cell := range cells {
+		switch payload := cell.Payload.(type) {
+		case ndtp.IntSensor02:
+			intSensor = payload.Odometer
+		case ndtp.Can10:
+			can10 = payload.AllTrack
+		case ndtp.Nav00:
+			navTrack = payload.Track
+		}
+	}
+	if intSensor == 0 || can10 == 0 {
+		t.Fatalf("эталонный пакет должен содержать оба источника: IntSensor02=%d Can10=%d", intSensor, can10)
+	}
+	if intSensor != uint32(navTrack) {
+		t.Errorf("IntSensor02.Odometer %d != Nav00.Track %d, вывод о единицах неверен", intSensor, navTrack)
+	}
+
+	observation := Build(1, cells, time.Now())
+	if observation.Odometer != can10 {
+		t.Errorf("Odometer %d, ожидался Can10.AllTrack %d", observation.Odometer, can10)
+	}
+	if want := float64(can10) / 100; observation.TotalKm != want {
+		t.Errorf("TotalKm %.2f, ожидалось %.2f (AllTrack/100)", observation.TotalKm, want)
+	}
+}

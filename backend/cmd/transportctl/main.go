@@ -14,11 +14,15 @@ const usage = `transportctl — предиктор изменений в гра�
 
 Команды:
   serve           принять NDTP-телематику и вести состояние устройств
+  features        построить кадры прогноза по сохранённой телеметрии
+  replay          переиграть размеченную выборку и сверить с метками
   ndtp-capture   принять NDTP-пакеты от эмулятора и сохранить в golden-файлы
   ndtp-inspect   разобрать сохранённые NDTP-пакеты (hexdump + JSON)
 
 Примеры:
-  transportctl serve --listen :9201 --verbose
+  transportctl serve --listen :9201 --plan plan.csv --binding binding.csv
+  transportctl features --plan plan.csv --binding binding.csv \
+      --input observations.jsonl --frames
   transportctl ndtp-capture --listen :9201 --duration 15s
   transportctl ndtp-inspect internal/ndtp/testdata/golden/packets.bin
 `
@@ -41,6 +45,10 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return runServe(args[1:])
+	case "features":
+		return runFeatures(args[1:])
+	case "replay":
+		return runReplay(args[1:])
 	case "ndtp-capture":
 		return runCapture(args[1:])
 	case "ndtp-inspect":
