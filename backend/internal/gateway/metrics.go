@@ -1,0 +1,114 @@
+package gateway
+
+import (
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
+)
+
+// metrics — GET /metrics, текстовый формат Prometheus.
+//
+// Формат пишется руками, а не через prometheus/client_golang: набор метрик
+// фиксирован и состоит из десятка чисел, а библиотека потянула бы за собой
+// целое дерево зависимостей в пакет, которому по ADR 0002 положено держать
+// минимальную поверхность. Ручной вывод означает, что при ошибке в метрике
+// страдает только /metrics, а не весь процесс.
+func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	var b strings.Builder
+	metric := func(name, help, kind string) {
+		fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+	}
+	value := func(name, help string, v float64) {
+		metric(name, help, "gauge")
+		fmt.Fprintf(&b, "%s %s\n", name, formatFloat(v))
+	}
+	counter := func(name, help string, v uint64) {
+		metric(name, help, "counter")
+		fmt.Fprintf(&b, "%s %d\n", name, v)
+	}
+
+	inc := s.incidents.Stats()
+	value("transport_gateway_vehicles", "сколько устройств сейчас в хранилище телеметрии",
+		float64(s.vehicleCount()))
+	value("transport_gateway_incidents_open", "открытых инцидентов", float64(inc.Open))
+	value("transport_gateway_incidents_acked", "инцидентов взято в работу", float64(inc.Acked))
+	value("transport_gateway_incidents_resolved", "закрытых инцидентов", float64(inc.Resolved))
+	incStats := s.incidents.Counters()
+	counter("transport_gateway_incidents_created_total", "сколько инцидентов открыто за всё время",
+		incStats.Created)
+	counter("transport_gateway_incidents_acked_total", "сколько раз инцидент взяли в работу",
+		incStats.Acked)
+
+	pred := s.preds.Stats()
+	value("transport_gateway_predictions_stored", "сколько прогнозов в хранилище", float64(pred.Stored))
+	counter("transport_gateway_predictions_total", "сколько прогнозов прошло за всё время", pred.Total)
+
+	// Доля деградации интересует дежурного больше абсолютного числа
+	// прогнозов: она растёт именно тогда, когда модель молчит.
+	if fb, ok := s.cfg.Predictor.(fallbackReporter); ok {
+		fst := fb.Stats()
+		if fst.Total > 0 {
+			value("transport_gateway_prediction_source_ratio",
+				"доля прогнозов, взятых не из модели",
+				float64(fst.Degraded())/float64(fst.Total))
+		}
+		counter("transport_gateway_predictions_from_model_total",
+			"прогнозов от модели", fst.FromModel)
+		counter("transport_gateway_predictions_from_cache_total",
+			"прогнозов из кэша устаревших ответов", fst.FromCache)
+		counter("transport_gateway_predictions_from_baseline_total",
+			"прогнозов по baseline", fst.FromBase)
+	}
+
+	// Латентность прогнозов: при отказе модели её рост — первый признак
+	// того, что пора смотреть в её логи.
+	lat := s.latency.Snapshot()
+	if lat.Count > 0 {
+		value("transport_gateway_prediction_latency_p50_s", "медиана латентности прогноза", lat.P50)
+		value("transport_gateway_prediction_latency_p95_s", "95-й перцентиль", lat.P95)
+		value("transport_gateway_prediction_latency_p99_s", "99-й перцентиль", lat.P99)
+		value("transport_gateway_prediction_latency_max_s", "максимум по окну", lat.Max)
+		counter("transport_gateway_prediction_latency_samples_total", "замеров латентности всего", lat.Total)
+	}
+
+	value("transport_gateway_uptime_s", "сколько работает гейтвей",
+		s.now().Sub(s.startedAt).Seconds())
+	if !readyzOK(s.cfg) {
+		value("transport_gateway_ready", "1, если гейтвей готов считать прогнозы", 0)
+	} else {
+		value("transport_gateway_ready", "1, если гейтвей готов считать прогнозы", 1)
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(b.String()))
+}
+
+// fallbackReporter — предиктор, умеющий рассказать о своей деградации.
+// Отдельный интерфейс, потому что знать о нём должен только /metrics, а
+// Predictor про счётчики не знает и знать не должен.
+type fallbackReporter interface {
+	Stats() predictor.StatsFallback
+}
+
+func (s *Server) vehicleCount() int {
+	if s.cfg.Store == nil {
+		return 0
+	}
+	return len(s.cfg.Store.Units())
+}
+
+func readyzOK(cfg Config) bool {
+	return cfg.Store != nil && cfg.Schedule != nil && cfg.Predictor != nil
+}
+
+// formatFloat печатает число в формате, который переживает разбор Prometheus.
+// Через strconv с 'g' целые значения печатаются как 1, а не 1.0, и это
+// экономит несколько байт на каждой метрике.
+func formatFloat(v float64) string {
+	return strconv.FormatFloat(v, 'g', -1, 64)
+}
