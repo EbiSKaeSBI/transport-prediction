@@ -9,10 +9,15 @@ target:
 sections:
 
   given:
-    computed_by: python
-    source: points.csv
+    computed_by: go
+    source: >
+      Офлайн берётся из points.csv как подсказка организаторов, онлайн
+      считается конвейером: отклонение последней остановки, у которой и
+      plan, и fact уже прошли к T. Определения расходятся намеренно —
+      эталон в 43.6% меток опирается на факт, наступающий ПОСЛЕ T.
+      См. ADR 0004, измерение в transportctl replay.
     features:
-      cur_dev_s: {type: float32, unit: s, nullable: false}
+      cur_dev_s: {type: float32, unit: s, nullable: true}
       horizon_s: {type: float32, unit: s, nullable: false, min: 600, max: 900}
       target_time_begin: {type: datetime, nullable: false}
       target_stop_id: {type: int32, nullable: false}

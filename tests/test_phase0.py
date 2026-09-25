@@ -728,3 +728,132 @@ class TestEndToEndSubmission:
             reader = csv.DictReader(f, delimiter=";")
             rows = list(reader)
         assert len(rows) == 151, f"Ожидалось 151 строк, получено {len(rows)}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Инвариант правила cur_dev_s (ADR 0004)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _event_seconds(value: str) -> float:
+    """Время события в секундах. Формат в файлах один и тот же."""
+    text = value.strip()
+    if "." in text:
+        head, frac = text.split(".", 1)
+        whole = datetime.fromisoformat(head)
+        return whole.replace(tzinfo=None).timestamp() + int((frac + "000000")[:6]) / 1e6
+    return datetime.fromisoformat(text).timestamp()
+
+
+class TestCurDevRule:
+    """Правило, которым построен cur_dev_s, должно остаться тем же.
+
+    Смысл теста не в том, чтобы зафиксировать конкретные проценты: раздача
+    может смениться, и цифры изменятся. Смысл в том, чтобы правка раздачи
+    или смена генератора немедленно ломала сборку. Если правило перестанет
+    восстанавливаться, значит ADR 0004 описывает уже не тот сигнал, и
+    онлайн-контур считает честную величину, которой обучение не
+    соответствует.
+    """
+
+    @staticmethod
+    @pytest.fixture(scope="class")
+    def schedule_by_vehicle() -> dict[str, list[tuple[float, float, float, int]]]:
+        rows = read_csv(ROOT / "test" / "schedule.csv")
+        by_veh: dict[str, list[tuple[float, float, float, int]]] = {}
+        for order, r in enumerate(rows):
+            if not r.get("tr_id") or not r.get("time_fact_begin"):
+                continue
+            plan = _event_seconds(r["time_begin"])
+            fact = _event_seconds(r["time_fact_begin"])
+            by_veh.setdefault(r["tr_id"], []).append(
+                (plan, fact, fact - plan, order)
+            )
+        for stops in by_veh.values():
+            stops.sort()
+        return by_veh
+
+    def _recover(self, by_veh, tr_id, when, cursor):
+        """Восстанавливает cur_dev_s по курсору: 'TB' — план, 'TF' — факт."""
+        stops = by_veh.get(tr_id, [])
+        index = 0 if cursor == "TB" else 1
+        candidates = [s for s in stops if s[index] <= when]
+        if not candidates:
+            return None
+        top = max(s[index] for s in candidates)
+        row = min((s for s in candidates if s[index] == top), key=lambda s: s[3])
+        return row[2]
+
+    def test_plan_cursor_reproduces_hint(self, schedule_by_vehicle) -> None:
+        """Плановый курсор воспроизводит подсказку почти точно.
+
+        Именно это доказывает находку 1 ADR 0004: подсказка опережает
+        известное на T.
+        """
+        labels = read_csv(ROOT / "labels" / "labels_test.csv")
+        agree = 0
+        compared = 0
+        for row in labels:
+            when = _event_seconds(row["T"])
+            value = self._recover(schedule_by_vehicle, row["tr_id"], when, "TB")
+            if value is None:
+                continue
+            compared += 1
+            agree += abs(value - float(row["cur_dev_s"])) < 1.0
+        rate = agree / compared
+        assert compared > 300, f"слишком мало точек для проверки: {compared}"
+        assert rate > 0.97, (
+            f"плановый курсор дал {rate:.2%}, ожидалось > 97%: "
+            "правило раздачи изменилось, ADR 0004 устарел"
+        )
+
+    def test_fact_cursor_matches_much_worse(self, schedule_by_vehicle) -> None:
+        """Честный курсор по факту расходится с подсказкой сильно.
+
+        Это не дефект расчёта, а измеренная величина утечки: если бы факт
+        и план совпадали по построению, строк с утечкой не существовало бы.
+        """
+        labels = read_csv(ROOT / "labels" / "labels_test.csv")
+        agree = 0
+        compared = 0
+        for row in labels:
+            when = _event_seconds(row["T"])
+            value = self._recover(schedule_by_vehicle, row["tr_id"], when, "TF")
+            if value is None:
+                continue
+            compared += 1
+            agree += abs(value - float(row["cur_dev_s"])) < 1.0
+        rate = agree / compared
+        assert rate < 0.60, (
+            f"честный курсор дал {rate:.2%}, ожидалось < 60%: "
+            "утечка в подсказке исчезла, ADR 0004 и онлайн-контур "
+            "расходятся по причине, которой больше нет"
+        )
+
+    def test_hint_really_uses_future_facts(self, schedule_by_vehicle) -> None:
+        """Доля меток, где подсказка опирается на факт после T.
+
+        Это прямая проверка утверждения «подсказка заглядывает в будущее».
+        Число ниже означает, что либо раздачу починили (тогда онлайн-контур
+        и обучение снова сойдутся), либо ADR 0004 пора переписать.
+        """
+        labels = read_csv(ROOT / "labels" / "labels_test.csv")
+        leaky = 0
+        compared = 0
+        for row in labels:
+            when = _event_seconds(row["T"])
+            stops = schedule_by_vehicle.get(row["tr_id"], [])
+            candidates = [s for s in stops if s[0] <= when]
+            if not candidates:
+                continue
+            compared += 1
+            top = max(s[0] for s in candidates)
+            row_used = min((s for s in candidates if s[0] == top), key=lambda s: s[3])
+            if row_used[1] > when:
+                leaky += 1
+        rate = leaky / compared
+        assert compared > 300, f"слишком мало точек для проверки: {compared}"
+        assert rate > 0.30, (
+            f"утечка в подсказке измеряется как {rate:.2%}, ожидалось > 30%: "
+            "ADR 0004 больше не описывает раздачу"
+        )
