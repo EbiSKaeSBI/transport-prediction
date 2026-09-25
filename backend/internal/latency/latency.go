@@ -1,4 +1,14 @@
-package gateway
+// Package latency хранит окно замеров и считает по нему квантили.
+//
+// Пакет отдельный, а не внутри gateway, потому что измерять приходится в двух
+// местах: гейтвей меряет путь «кадр пришёл → прогноз доставлен», а клиент
+// модели — только обращение к ml-core. Второе живёт в пакете predictor, который
+// импортирует gateway по дороге к отдаче прогноза, поэтому наоборот — из
+// predictor в gateway — не выйдет: получился бы цикл импортов. Общее окно
+// измерений вместо двух копий: расхождение двух реализаций квантилей сначала
+// выглядит безобидно, а потом метрики в /metrics перестают совпадать с
+// тем, что на самом деле отвечает модель.
+package latency
 
 import (
 	"math"
@@ -7,20 +17,20 @@ import (
 	"time"
 )
 
-// DefaultLatencyWindow — сколько замеров удерживаем. 1024 замера при
+// DefaultWindow — сколько замеров удерживаем по умолчанию. 1024 замера при
 // тике 15 с и трёх прогнозах в секунду покрывает примерно шесть минут, чего
 // хватает, чтобы увидеть и внезапную деградацию, и разовый выброс, не
 // размазывая его по часовому окну, где он уже не виден.
-const DefaultLatencyWindow = 1024
+const DefaultWindow = 1024
 
-// Latency — окно замеров с квантилями.
+// Window — окно замеров с квантилями.
 //
 // Хранится кольцо фиксированного размера, а не растущий слайс: замеры идут
 // постоянно, и неограниченный накопленный список рано или поздно съел бы
 // память процесса, который обязан работать месяцами без перезапуска.
 // Растущий слайс к тому же заставлял бы сортировать всё окно на каждый запрос
 // /metrics.
-type Latency struct {
+type Window struct {
 	// window — кольцо замеров.
 	window []float64
 	// next — куда писать следующий замер.
@@ -38,18 +48,18 @@ type Latency struct {
 	mu     sync.Mutex
 }
 
-// NewLatency создаёт окно. Неположительный размер берёт DefaultLatencyWindow.
-func NewLatency(size int) *Latency {
+// New создаёт окно. Неположительный размер берёт DefaultWindow.
+func New(size int) *Window {
 	if size <= 0 {
-		size = DefaultLatencyWindow
+		size = DefaultWindow
 	}
-	return &Latency{window: make([]float64, size)}
+	return &Window{window: make([]float64, size)}
 }
 
 // Observe добавляет замер в секундах. Отрицательные значения и NaN
 // отбрасываются: такой замер говорит о баге в измерении, а не о медленном
 // ответе, и попадание в квантили исказило бы их для всех.
-func (l *Latency) Observe(seconds float64) {
+func (l *Window) Observe(seconds float64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.count++
@@ -65,7 +75,7 @@ func (l *Latency) Observe(seconds float64) {
 }
 
 // ObserveDuration добавляет замер из time.Duration.
-func (l *Latency) ObserveDuration(d time.Duration) {
+func (l *Window) ObserveDuration(d time.Duration) {
 	l.Observe(d.Seconds())
 }
 
@@ -88,7 +98,7 @@ type Quantiles struct {
 
 // Snapshot считает квантили. Сортируется копия: сама перестановка окна
 // испортила бы порядок замеров, а следующая выборка считалась бы по мусору.
-func (l *Latency) Snapshot() Quantiles {
+func (l *Window) Snapshot() Quantiles {
 	l.mu.Lock()
 	values := make([]float64, l.filled)
 	copy(values, l.window[:l.filled])

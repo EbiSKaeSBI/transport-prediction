@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/schedule"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/statestore"
@@ -81,7 +82,7 @@ type Server struct {
 	mux       *http.ServeMux
 	incidents *Incidents
 	preds     *Predictions
-	latency   *Latency
+	latency   *latency.Window
 	log       *slog.Logger
 	now       func() time.Time
 	startedAt time.Time
@@ -106,7 +107,7 @@ func New(cfg Config) *Server {
 		mux:       http.NewServeMux(),
 		incidents: NewIncidents(cfg.IncidentCap),
 		preds:     NewPredictions(cfg.PredictionCap),
-		latency:   NewLatency(cfg.LatencyWindow),
+		latency:   latency.New(cfg.LatencyWindow),
 		log:       cfg.Logger,
 		now:       cfg.Now,
 		startedAt: cfg.Now(),
