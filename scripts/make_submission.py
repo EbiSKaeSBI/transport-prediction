@@ -41,6 +41,13 @@ def load_model(path: Path) -> dict[str, float]:
     return {r["sample_id"]: float(r["prediction"]) for r in rows}
 
 
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Собрать submission.csv")
     parser.add_argument("--model", type=Path, help="CSV с предсказаниями модели")
@@ -61,7 +68,8 @@ def main() -> int:
     missing = [r["sample_id"] for r in sample_rows if r["sample_id"] not in points]
     if missing:
         print(
-            f"Нет телеметрии для {len(missing)} sample_id, например {missing[:3]}", file=sys.stderr
+            f"Нет телеметрии для {len(missing)} sample_id, например {missing[:3]}",
+            file=sys.stderr,
         )
         return 1
 
@@ -84,7 +92,7 @@ def main() -> int:
         writer.writerows(rows)
 
     values = [float(r["prediction"]) for r in rows]
-    print(f"Записано {len(rows)} строк в {args.out.relative_to(ROOT)}")
+    print(f"Записано {len(rows)} строк в {display_path(args.out)}")
     print(f"Разделитель ';' | колонки {EXPECTED_COLUMNS}")
     if fallback:
         print(f"Базовая подстановка cur_dev_s: {fallback} из {len(rows)}")

@@ -38,7 +38,9 @@ def parse_ts(value: str) -> datetime:
     text = value.strip()
     if "." in text:
         base, frac = text.split(".", 1)
-        return datetime.fromisoformat(base).replace(microsecond=int((frac + "000000")[:6]))
+        return datetime.fromisoformat(base).replace(
+            microsecond=int((frac + "000000")[:6])
+        )
     return datetime.fromisoformat(text)
 
 
@@ -75,23 +77,32 @@ def prove_leak() -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
     )
     only_in_test = [c for c in test_sched[0] if c not in val_sched[0]]
     print()
-    print(f"  test/schedule.csv          {len(test_sched)} строк, {len(test_sched[0])} колонок")
-    print(f"  validate/schedule_plan.csv {len(val_sched)} строк, {len(val_sched[0])} колонок")
+    print(
+        f"  test/schedule.csv          {len(test_sched)} строк, {len(test_sched[0])} колонок"
+    )
+    print(
+        f"  validate/schedule_plan.csv {len(val_sched)} строк, {len(val_sched[0])} колонок"
+    )
     print(f"  общие колонки              {len(shared)}: {', '.join(shared)}")
     print(f"  колонка только в test      {', '.join(only_in_test)}")
     print(f"  строки совпадают           {'ДА' if same_rows else 'НЕТ'}")
 
-    fact = {r["tt_action_item_id"]: r for r in test_sched if r["time_fact_begin"].strip()}
+    fact = {
+        r["tt_action_item_id"]: r for r in test_sched if r["time_fact_begin"].strip()
+    }
     points = read_csv(ROOT / "validate" / "points.csv")
     matched = [p for p in points if p["target_stop_id"] in fact]
     print()
     print(f"  validate/points.csv        {len(points)} прогнозных точек")
-    print(f"  target_stop_id найден в test/schedule.csv: {len(matched)} из {len(points)}")
+    print(
+        f"  target_stop_id найден в test/schedule.csv: {len(matched)} из {len(points)}"
+    )
 
     plan_mismatch = [
         p
         for p in matched
-        if parse_ts(fact[p["target_stop_id"]]["time_begin"]) != parse_ts(p["target_time_begin"])
+        if parse_ts(fact[p["target_stop_id"]]["time_begin"])
+        != parse_ts(p["target_time_begin"])
     ]
     print(
         f"  plan-время совпадает с target_time_begin: {len(points) - len(plan_mismatch)} из {len(points)}"
@@ -102,7 +113,9 @@ def prove_leak() -> tuple[list[dict[str, str]], dict[str, dict[str, str]]]:
     return points, fact
 
 
-def oracle_truth(points: list[dict[str, str]], fact: dict[str, dict[str, str]]) -> dict[str, float]:
+def oracle_truth(
+    points: list[dict[str, str]], fact: dict[str, dict[str, str]]
+) -> dict[str, float]:
     truth: dict[str, float] = {}
     for point in points:
         row = fact[point["target_stop_id"]]
@@ -123,7 +136,9 @@ def cross_check(truth: dict[str, float]) -> None:
     print(f"  макс. расхождение oracle vs labels_test: {max(diffs):.0f} с")
     print(f"  среднее расхождение:                     {statistics.fmean(diffs):.2f} с")
     print(
-        "  Оракул корректен." if max(diffs) <= 1.0 else "  ВНИМАНИЕ: оракул расходится с разметкой."
+        "  Оракул корректен."
+        if max(diffs) <= 1.0
+        else "  ВНИМАНИЕ: оракул расходится с разметкой."
     )
 
 
@@ -144,7 +159,9 @@ def validate_report(points: list[dict[str, str]], truth: dict[str, float]) -> No
     pairs_cur = [(float(p["cur_dev_s"]), truth[p["sample_id"]]) for p in points]
     mae_zero = mae(pairs_zero)
     mae_cur = mae(pairs_cur)
-    print(f"  mae_zero (pred=0)         {mae_zero:7.2f} с   <- делитель в формуле скоринга")
+    print(
+        f"  mae_zero (pred=0)         {mae_zero:7.2f} с   <- делитель в формуле скоринга"
+    )
     print(
         f"  MAE при pred=cur_dev_s    {mae_cur:7.2f} с   score = {max(0.0, 1 - mae_cur / mae_zero):.4f}"
     )
@@ -164,13 +181,18 @@ def validate_report(points: list[dict[str, str]], truth: dict[str, float]) -> No
     print(f"    дрифт min    {min(deltas):+8.1f} с")
     print(f"    дрифт max    {max(deltas):+8.1f} с")
     print()
-    print(f"  Вывод: std дрифта {statistics.pstdev(deltas):.0f} с означает, что абсолютное")
+    print(
+        f"  Вывод: std дрифта {statistics.pstdev(deltas):.0f} с означает, что абсолютное"
+    )
     print("  значение таргета предсказывать напрямую тяжело. Рабочая цель — дельта.")
 
 
 def main() -> int:
     if not (ROOT / "validate" / "points.csv").exists():
-        print("Не найден validate/points.csv — запускайте из корня репозитория.", file=sys.stderr)
+        print(
+            "Не найден validate/points.csv — запускайте из корня репозитория.",
+            file=sys.stderr,
+        )
         return 1
     points, fact = prove_leak()
     truth = oracle_truth(points, fact)

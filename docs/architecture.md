@@ -13,7 +13,7 @@
 | Вопрос | Ответ |
 |---|---|
 | Стек | Go (весь онлайн-контур) + Python 3.12 (ML) + React/TypeScript (дашборд) + PostgreSQL, всё в Docker Compose |
-| NDTP-парсер | **Go**, `encoding/binary` + `hash/crc16` (Modbus). Python отпадает: библиотек нет, писать вручную на `struct` — тот же объём кода без выигрыша |
+| NDTP-парсер | **Go**, `encoding/binary` + собственная реализация CRC-16/Modbus в пакете `ndtp` (`hash/crc16` отсутствует в этой сборке Go). Python отпадает: библиотек нет, писать вручную на `struct` — тот же объём кода без выигрыша |
 | Модель | CatBoost (MAE-objective) на дельте `target − cur_dev_s`, ансамбль с PyTorch temporal encoder, экспорт в ONNX |
 | Реалистичная цель | критерий 1: 4–5 из 6 баллов; критерии 2–5: по полной |
 
@@ -82,7 +82,7 @@ README утверждает, что baseline даёт ≈ 0.40 — это **не
 | Слой | Технология | Обоснование |
 |---|---|---|
 | **Backend (онлайн)** | **Go 1.24+** | NDTP-сервер, состояние, map matching, признаки, REST/WS, оркестрация |
-| NDTP-парсер | Go: `encoding/binary`, `hash/crc16` | см. раздел 3 |
+| NDTP-парсер | Go: `encoding/binary`, CRC-16/Modbus собственной реализации | см. раздел 3 и 8.1 |
 | Внутренний RPC | protobuf + gRPC (`ml.proto`) | типизированный контракт Go ↔ Python |
 | In-memory состояние | кольцевые буферы на ТС, шардинг по `unitId` | горячий путь без обращения к БД |
 | Хранилище | PostgreSQL 16 | планы, остановки, рейсы, прогнозы, инциденты, метрики; materialized views для аналитики |
@@ -123,10 +123,12 @@ README утверждает, что baseline даёт ≈ 0.40 — это **не
 **4. Один бинарник = один маленький образ.** Статическая линковка, `FROM scratch`,
 холодный старт < 1 с. Критерий 5 прямо снижает балл при непредсказуемом старте контейнеров.
 
-**5. Ноль train/serve skew — главный технический аргумент на питче.** Go считает признаки
-и для онлайна, и для офлайна: тот же код вызывается из `cmd/tsfeature -mode=replay`
-на исторических CSV. Расхождение между обучением и продакшеном исключено по построению,
-а не «аккуратно».
+**5. Ноль train/serve skew — главный технический аргумент на питче.** Go должен
+считать признаки и для онлайна, и для офлайна: тот же код вызывается из
+`transportctl replay` на исторических CSV. Расхождение между обучением и
+продакшеном исключается по построению, а не «аккуратно». *Пакет `features` и
+команда `replay` пока не реализованы — это цель этапа 2, а не текущее
+состояние репозитория.*
 
 **6. Тестируемость бинарного протокола.** Единственно надёжный тест — golden-файлы:
 снять реальные пакеты эмулятора в `.bin`, затем `Decode(golden) == expected struct`
@@ -157,8 +159,10 @@ Go дополнительно отдаёт Python **компактное окн�
 
 `features/v1.yaml` — имя, тип, порядок, null-семантика, единицы измерения.
 Go реализует и выгружает; Python при загрузке модели сверяет список имён и падает при расхождении.
-Golden-тест: `tsfeature -mode=replay` на `train/` даёт parquet, на котором обучалась модель,
-значит фичи train и serve тождественны по построению.
+Golden-тест (планируется): офлайн-выгрузка на `train/` должна давать parquet,
+на котором обучалась модель, — тогда фичи train и serve тождественны по
+построению. Пакет `features` в `transportctl` ещё не реализован, поэтому
+сейчас это требование не проверяется автоматически.
 
 ---
 
@@ -168,8 +172,8 @@ Golden-тест: `tsfeature -mode=replay` на `train/` даёт parquet, на �
 ┌──────────────┐  NDTP / TCP :9201          ┌──────────────────────────────────────────────┐
 │  Эмулятор    │───────────────────────────▶│  ① Go · NDTP Ingest                          │
 │  (или        │  NPL(15) + NPH(10) + тело  │  • handshake FSM, reconnect с backoff        │
-│   replay     │  CRC-16/Modbus, little-end  │  • декодер ячеек Nav00/Usi08/Termo16/…     │
-│   из CSV)    │                            │  • per-unit ring buffer на 90 точек          │
+│   запись     │  CRC-16/Modbus, little-end  │  • декодер всех 23 типов ячеек              │
+│   NDTP)      │                            │  • per-unit ring buffer на 90 точек          │
 └──────────────┘                            └───────────────────┬──────────────────────────┘
                                                              │ VehicleFrame
 ┌────────────────────────────────────────────────────────────▼─────────────────────────┐
@@ -409,22 +413,26 @@ docs/
   adr/0003-single-instance-hub.md
   adr/0004-offline-dashboard.md
 proto/
-  ndtp.proto   ml.proto
-backend/                      # Go
-  cmd/gateway/                REST + WS + Swagger
-  cmd/ndtp-server/            TCP :9201
-  cmd/tsfeature/              CLI: replay CSV / live → parquet признаков
-  cmd/replay-csv/             воспроизведение исторического потока
+  ml.proto                       контракт gRPC Go ↔ Python
+backend/                          # Go 1.24+, без внешних зависимостей
+  go.mod
+  cmd/transportctl/               единственный бинарник, подкоманды:
+    main.go                         serve | ndtp-capture | ndtp-inspect
+    serve.go                        приём NDTP, состояние устройств, JSONL
+    ndtp_capture.go                 запись пакетов в golden-файлы
+    ndtp_inspect.go                 разбор сохранённых пакетов
   internal/
-    ndtp/                     NPL/NPH/ячейки + CRC-16/Modbus   ← парсер
+    ndtp/                       NPL/NPH, ячейки, CRC-16/Modbus   ← парсер
+      testdata/golden/            реальные пакеты эмулятора
+    ndtpserver/                 TCP-сервер, FSM, метрики, строгий режим
+    telemetry/                  ячейки → Observation, JSONL, счётчики
     statestore/  schedule/  stopdetect/  mapmatch/
     features/                 FEATURE CONTRACT v1
     horizon/                  планировщик T+10…15
     mlclient/                 gRPC/HTTP клиент к Python
     api/  ws/  resilience/  store/
-  testdata/golden/            бинарные пакеты эмулятора
 ml/                           # Python 3.12, управляется uv
-  pyproject.toml
+  pyproject.toml  uv.lock
   src/predictor/service.py
   src/predictor/features/     ОДНА функция для train и serve
   src/predictor/models/       catboost.py, torch_temporal.py, blend.py
@@ -435,12 +443,106 @@ dashboard/                    # React + TS + Vite + MapLibre + ECharts
 infra/
   postgres/init.sql   prometheus/
 scripts/
+  emu_native.py                запуск JAR-эмулятора без Docker
   oracle_audit.py             локальный MAE по утечке (НЕ в prediction-path)
   make_submission.py          генерация submission.csv
   smoke_test.sh               end-to-end проверка
   jury_demo.sh               сценарий демонстрации жюри
+tests/                        # проверки инвариантов фазы 0 (pytest)
 features/v1.yaml              контракт признаков
 ```
+
+### 8.1. Разбор NDTP
+
+Протокол разбирается пакетом `backend/internal/ndtp` без кодогенерации:
+`proto/ndtp.proto` не создаётся. Причина и рассмотренные альтернативы —
+в [ADR 0001](adr/0001-ndtp-parser-in-go.md).
+
+Кадр: NPL 15 байт, NPH 10 байт, little-endian, сигнатура 0x7E7E, CRC-16/Modbus
+(poly 0xA001, init 0xFFFF) над NPH вместе с телом, в NPL — со свапом байтов.
+Handshake — NPH type 100, тело 18 байт; телематика — type 101, serviceId 1.
+Типа ячейки 1 в протоколе нет.
+
+В каждом кадре ровно один NPH: `dataSize = 10 + длина тела`. Флаговые слова
+NPL и NPH устроены по-разному, и это важно:
+
+| Слово | бит 0 | бит 1 | бит 2 | биты 3… |
+|---|---|---|---|---|
+| флаги NPL | `nplFlagEncryption` | `nplFlagCrc` | `nplFlagDelay` | `flags`, 13 бит |
+| флаги NPH | `nphFlagRequest` | `flags`, 15 бит | | |
+| флаги тела handshake | `connectionEncryptionFlag` | `connectionCrcFlag` | `connectionSimulateFlag` | `connectionFlags`, 13 бит |
+
+Бит запроса существует только в NPH. Эмулятор вендора всегда заполняет поле
+CRC и никогда не выставляет `nplFlagCrc`, поэтому сумма проверяется
+независимо от флага, а кадры `NPL_TYPE_ERROR` (1) и `NPL_TYPE_DEBUG` (3) не
+принимаются.
+
+Идентификаторы типов пакетов переиспользованы между сервисами, поэтому сам по
+себе тип не определяет назначение — нужно знать и `serviceId`:
+
+| serviceId | сервис | тип 0 | тип 100 | тип 101 |
+|---|---|---|---|---|
+| 0 | GenericControls | `RESULT` | `CONN_REQUEST` | — |
+| 1 | Navdata | `RESULT` | `HISTORY` | `REALTIME` |
+
+Телеметрию несёт только `REALTIME` сервиса Navdata. `RESULT` и `HISTORY`
+известны протоколу, но не несут телеметрии: они учитываются метрикой
+`SkippedPackets` и не разрывают соединение. Любой другой тип или сервис
+разрывает соединение как структурная ошибка.
+
+Шифрование не реализовано. Кадр, объявивший шифрование в NPL или в теле
+handshake, отклоняется явно со счётчиком `EncryptedRejects`, чтобы
+шифротекст не разбирался как данные. Границы того, что подтверждено
+байткодом вендора, а что нет, перечислены в комментарии
+`TestValidationBoundariesAreDocumented`.
+
+Длина ячейки в потоке не передаётся, поэтому границы определяются по типу
+через таблицу размеров. Все 23 типа зарегистрированы и полностью декодируются:
+
+| Тип | Имя | Байт | Тип | Имя | Байт |
+|---|---|---|---|---|---|
+| 0 | Nav00 | 26 | 14 | Bms14 | 15 |
+| 2 | IntSensor02 | 26 | 15 | Lls15 | 50 |
+| 3 | Crown03 | 14 | 16 | Termo16 | 8 |
+| 4 | Irma04 | 15 | 17 | Alcohol1st17 | 46 |
+| 5 | Kdm05 | 6 | 18 | CAN18 | 50 |
+| 6 | Idn06 | 9 | 19 | GSMstations19 | 40 |
+| 7 | Idn07 | 1 | 20 | M333CAN20 | 8 |
+| 8 | Usi08 | 6 | 21 | Alcohol2nd21 | 180 |
+| 9 | Reg09 | 40 | 22 | ServerStatistics22 | 24 |
+| 10 | Can10 | 37 | 23 | TrackerStatistics23 | 16 |
+| 12 | Rfid12 | 5 | 100 | ZipSensorData100 | 44 |
+| 13 | Plo13 | 13 | | | |
+
+Порядок полей и их разрядность восстановлены из байткода классов вендора
+(`BOOT-INF/classes/.../navdata/cells/G6Cell*.class`), а не взяты из
+документации. Раскладка проверена тремя независимыми способами:
+
+1. Сумма ширин полей каждого типа совпала с измеренным на эмуляторе размером
+   payload — 23 из 23.
+2. Эмулятору через конфигурацию заданы различимые значения **каждого** поля
+   **каждого** типа; пакет с ответом разобран и сверен поле в поле
+   (`TestWireFormatFieldsMatchVendorSerializer`). Это подтверждает и порядок
+   полей, и разрядность, и то, что битовые поля (`Bms14`, `Irma04`)
+   упаковываются с первого младшего бита.
+3. Автосгенерированный пакет со всеми 23 типами целиком разбирается без
+   остатка: 725 байт тела, ровно 23 ячейки.
+
+В режиме `autoGenerate` эмулятор шлёт 5 ячеек: Nav00, Usi08, Termo16,
+IntSensor02, Can10 — без Lls15. Эмулятор всегда добавляет Nav00 к запрошенным
+ячейкам, даже при `autoGenerate: false`. Ячейки, перечисленные в конфигурации,
+заполняются заданными значениями; без явных значений приходят нулями. На живых
+пакетах подтверждено, что `Nav00.SpeedAvg` совпадает с `Can10.Speed`.
+
+Разбор строгий: неизвестный тип ячейки, нехватка байт, несовпадение CRC,
+неверная сигнатура, неожиданный `serviceId` или тип NPH и лишние байты в конце
+тела рвут соединение, причина фиксируется в метриках. Штатное отключение
+устройства (`EOF`) ошибкой не считается. Пакеты эмулятора сохранены в
+`backend/internal/ndtp/testdata/golden` и служат основой тестов, поэтому тесты
+не требуют Java и Docker.
+
+CRC-16/Modbus реализован внутри пакета: `hash/crc16` отсутствует в
+используемой сборке Go. Эталонный вектор `123456789` даёт 0x4B37.
 
 ---
 
@@ -463,8 +565,8 @@ features/v1.yaml              контракт признаков
 | Фаза | Содержание | Результат |
 |---|---|---|
 | **0** | `uv`-env, `oracle_audit.py`, `docs/data-audit.md` | точный локальный MAE + отчёт об утечке |
-| **1** | Go: NDTP-декодер + golden-тесты на пакетах эмулятора | закрыт риск протокола |
-| **2** | Go: `statestore` + `stopdetect` + `mapmatch` + `tsfeature -mode=replay` | parquet с признаками, детекция прибытий |
+| **1** | Go: NDTP-декодер + golden-тесты на пакетах эмулятора | закрыт риск протокола | **выполнен** |
+| **2** | Go: `statestore` + `stopdetect` + `mapmatch` + офлайн-выгрузка признаков | parquet с признаками, детекция прибытий |
 | **3** | Python: v1 → v3 CatBoost, отбор по оракулу | MAE ≤ 60 |
 | **4** | Go: gateway, OpenAPI, WebSocket, планировщик горизонта | end-to-end поток |
 | **5** | Дашборд: карта, риск, карточки, live-обновления | критерий 4 |
