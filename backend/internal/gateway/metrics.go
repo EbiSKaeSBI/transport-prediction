@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
 )
 
@@ -76,6 +77,47 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		counter("transport_gateway_prediction_latency_samples_total", "замеров латентности всего", lat.Total)
 	}
 
+	// Очередь прогнозов. До этого блока отброшенные кадры были видны
+	// только в текстовой сводке при остановке, а очередь — нигде: молчащая
+	// потеря кадров при живом процессе выглядит как «всё спокойно», и это
+	// худший вид молчания, потому что данные уже не вернуть.
+	if s.cfg.Queue != nil {
+		q := s.cfg.Queue()
+		value("transport_gateway_prediction_queue_depth", "кадров ждут модели", float64(q.Depth))
+		counter("transport_gateway_predictions_submitted_total", "кадров принято планировщиком",
+			uint64(max64(q.Submitted, 0)))
+		counter("transport_gateway_predictions_predicted_total", "кадров дошло до ответа",
+			uint64(max64(q.Predicted, 0)))
+		counter("transport_gateway_predictions_dropped_total",
+			"кадров отброшено из-за полной очереди", uint64(max64(q.Dropped, 0)))
+		counter("transport_gateway_predictions_abandoned_total",
+			"кадров осталось в очереди при остановке", uint64(max64(q.Abandoned, 0)))
+		counter("transport_gateway_prediction_batches_total", "обращений к модели батчем",
+			uint64(max64(q.Batches, 0)))
+		counter("transport_gateway_prediction_batched_frames_total", "кадров, обслуженных батчем",
+			uint64(max64(q.BatchedFrames, 0)))
+		if q.BatchSize.Total > 0 {
+			bs := q.BatchSize
+			value("transport_gateway_prediction_batch_size_p50", "медиана размера пачки", bs.P50)
+			value("transport_gateway_prediction_batch_size_p95", "95-й перцентиль размера пачки", bs.P95)
+			value("transport_gateway_prediction_batch_size_p99", "99-й перцентиль размера пачки", bs.P99)
+		}
+	}
+
+	// Латентность самой модели. Отдельно от латентности прогноза выше:
+	// вместе они отвечают на вопрос «мы медленные или модель», который по
+	// одному числу неразличим.
+	if s.cfg.Inference != nil {
+		inf := s.cfg.Inference()
+		if inf.Total > 0 {
+			value("transport_gateway_inference_latency_p50_s", "медиана времени обращения к модели", inf.P50)
+			value("transport_gateway_inference_latency_p95_s", "95-й перцентиль", inf.P95)
+			value("transport_gateway_inference_latency_p99_s", "99-й перцентиль", inf.P99)
+			value("transport_gateway_inference_latency_max_s", "максимум по окну", inf.Max)
+			counter("transport_gateway_inference_latency_samples_total", "замеров инференции всего", inf.Total)
+		}
+	}
+
 	// Лента. Молчащая лента при живой панели выглядит как «всё спокойно»,
 	// поэтому число подписчиков и число отброшенных событий — не
 	// справочные, а сигнальные метрики.
@@ -101,6 +143,22 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(b.String()))
 }
 
+// QueueStats — снимок очереди прогнозов в момент чтения /metrics.
+type QueueStats struct {
+	// Depth — кадров ждут модели прямо сейчас. Растёт, когда модель не
+	// справляется, и это первый признак, что пора смотреть в её сторону.
+	Depth int
+	// Submitted, Predicted, Dropped, Abandoned — счётчики планировщика за
+	// всё время работы.
+	Submitted, Predicted, Dropped, Abandoned int64
+	// Batches, BatchedFrames — обращения батчем и кадров в них.
+	Batches, BatchedFrames int64
+	// BatchSize — распределение размеров пачек. Помогает отличить «батчинг
+	// не настроен» от «батчинг настроен, но выродился в пачки по одному
+	// кадру»: счётчики в обоих случаях выглядят правдоподобно.
+	BatchSize latency.Quantiles
+}
+
 // fallbackReporter — предиктор, умеющий рассказать о своей деградации.
 // Отдельный интерфейс, потому что знать о нём должен только /metrics, а
 // Predictor про счётчики не знает и знать не должен.
@@ -113,6 +171,16 @@ func (s *Server) vehicleCount() int {
 		return 0
 	}
 	return len(s.cfg.Store.Units())
+}
+
+// max64 защищает вывод счётчиков от отрицательных значений. Счётчики
+// планировщика растут монотонно, но берутся извне, а метрика с минусом в
+// экспорте выглядит как ошибка данных и портит графики у того, кто их читает.
+func max64(v, floor int64) int64 {
+	if v < floor {
+		return floor
+	}
+	return v
 }
 
 func readyzOK(cfg Config) bool {

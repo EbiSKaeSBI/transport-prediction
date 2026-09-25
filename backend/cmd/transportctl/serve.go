@@ -14,6 +14,7 @@ import (
 
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/gateway"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/horizon"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/ndtpserver"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/pipeline"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
@@ -258,6 +259,23 @@ func buildService(opts serviceOptions) (*service, error) {
 			Binding:   opts.Pipeline.Binding,
 			Predictor: opts.Predictor,
 			Hub:       hub,
+			// Метрики очереди и инференции читаются через замыкания: к
+			// моменту чтения планировщик уже собран, а гейтвей не должен
+			// знать, кто перед ним стоит.
+			Queue: func() gateway.QueueStats {
+				st := sched.Stats()
+				return gateway.QueueStats{
+					Depth:         sched.QueueLen(),
+					Submitted:     st.Submitted,
+					Predicted:     st.Predicted,
+					Dropped:       st.Dropped,
+					Abandoned:     st.Abandoned,
+					Batches:       st.Batches,
+					BatchedFrames: st.BatchedFrames,
+					BatchSize:     sched.BatchSizeQuantiles(),
+				}
+			},
+			Inference: inferenceWindow(opts.Predictor),
 			Logger:    logger,
 		})
 	}
@@ -296,6 +314,16 @@ func predictorChain(mlURL string, timeout time.Duration, logger *slog.Logger) pr
 	return predictor.NewFallback(pred, predictor.BaselinePredictor{}, 0)
 }
 
+// inferenceWindow достаёт окно замеров у настроенной цепочки прогноза.
+// Отсутствие окна — не поломка: цепочка без модели (baseline) замерять
+// инференцию не может, и метрики просто не публикуются.
+func inferenceWindow(p predictor.Predictor) func() latency.Quantiles {
+	if w, ok := p.(predictor.InferenceWindow); ok {
+		return w.Inference
+	}
+	return nil
+}
+
 func reportStats(ctx context.Context, addr string, observer *telemetry.Observer,
 	server *ndtpserver.Server, pipe *pipeline.Pipeline, sched *scheduler.Scheduler,
 	logger *slog.Logger, every time.Duration) {
@@ -332,8 +360,14 @@ func reportStats(ctx context.Context, addr string, observer *telemetry.Observer,
 				"без_окна", forecast.NoSchedule,
 				"без_данных_на_T", forecast.NoStateAtT,
 				"в_очереди", queue.BySource,
+				"ждёт_модели", sched.QueueLen(),
 				"предсказано", queue.Predicted,
-				"отброшено", queue.Dropped)
+				"отброшено", queue.Dropped,
+				"батчей", queue.Batches,
+				// Медиана размера пачки показывает, батчинг ли вообще
+				// работает: при батче по одному кадру медиана равна единице,
+				// и это читается сразу, без сравнения счётчиков.
+				"кадров_в_батче", sched.BatchSizeQuantiles().P50)
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/horizon"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
 )
 
 // DefaultStaleTTL — сколько прогноз модели может лежать в кэше и ещё считаться
@@ -137,6 +138,27 @@ func (f *Fallback) Predict(ctx context.Context, frame horizon.Frame) Prediction 
 	}
 	f.nBase.Add(1)
 	return p
+}
+
+// InferenceWindow — предиктор, умеющий отдать окно замеров времени обращения
+// к модели. Отдельный интерфейс по той же причине, что и Batcher: /metrics
+// интересует эта способность, а не весь предиктор.
+type InferenceWindow interface {
+	// Inference возвращает квантили по окну замеров.
+	Inference() latency.Quantiles
+}
+
+// Inference отдаёт окно замеров модели, если она в цепочке есть.
+//
+// Проброс нужен потому, что настроенная цепочка — это Fallback, а модель под
+// ним: спрашивать про окно у цепочки правильно, спрашивать у клиента —
+// значило бы знать, как именно цепочка собрана. У цепочки без модели окно
+// пустое, и это честное «замеров не было», а не «модель отвечала мгновенно».
+func (f *Fallback) Inference() latency.Quantiles {
+	if w, ok := f.aware.(InferenceWindow); ok {
+		return w.Inference()
+	}
+	return latency.Quantiles{}
 }
 
 // PredictBatch обслуживает пачку кадров по той же цепочке, что и Predict, но
