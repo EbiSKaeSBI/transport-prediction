@@ -277,20 +277,6 @@ func (s *Server) stream(w http.ResponseWriter, r *http.Request) {
 	h.unsubscribe(sub.id)
 }
 
-// vehicleEvent — карточка машины в ленте.
-//
-// Идентификатор машины лежит рядом с прогнозом, а не внутри него: по нему
-// лента решает, можно ли отправлять событие (чаще раза в секунду на машину
-// нельзя), и по нему же панель ищет карточку. Внутри predictionView его нет
-// намеренно — прогноз принадлежит модели, и её схема не обязана знать про
-// транспорт.
-type vehicleEvent struct {
-	UnitID     uint32         `json:"unit_id"`
-	TRID       int64          `json:"tr_id"`
-	TargetStop int64          `json:"target_stop_id"`
-	Prediction predictionView `json:"prediction"`
-}
-
 // incidentEvent — изменение инцидента в ленте.
 //
 // Счётчики едут вместе с инцидентом, а не отдельным событием: панель
@@ -308,15 +294,22 @@ type incidentEvent struct {
 }
 
 // publishVehicle отправляет карточку машины в ленту.
+//
+// Лента отдаёт ровно ту карточку, что и REST: panel получает позицию,
+// скорость, риск и открытый инцидент без отдельного запроса на машину. Раньше
+// лента несла отдельную узкую форму без координат, и панели приходилось
+// догружать каждую карточку, а при обновлении раз в секунду это запрос на
+// каждую машину на каждый тик.
+//
+// Порядок вызовов в Observe значим: preds.Put идёт до publishVehicle, и
+// поэтому прогноз в карточке — текущий, а не предыдущий. Если переставить
+// вызовы, лента станет тихо врать на один тик, и это заметно только глазами.
 func (s *Server) publishVehicle(p predictor.Prediction) {
 	h := s.Hub()
 	if h == nil {
 		return
 	}
-	data, err := json.Marshal(vehicleEvent{
-		UnitID: p.UnitID, TRID: p.TRID, TargetStop: p.TargetStopID,
-		Prediction: viewOf(p),
-	})
+	data, err := json.Marshal(s.vehicle(p.UnitID))
 	if err != nil {
 		return
 	}
@@ -357,13 +350,10 @@ func (s *Server) snapshot() []Event {
 	// Снимок берётся из хранилища, а не из наличия предиктора: прогнозы,
 	// доставленные до перезапуска конфигурации, принадлежат панели по
 	// праву, и прятать их из-за отсутствия предиктора значило бы врать.
-	var all []vehicleEvent
+	var all []vehicleView
 	for _, unit := range s.knownUnits() {
-		if p, ok := s.preds.Latest(unit); ok {
-			all = append(all, vehicleEvent{
-				UnitID: unit, TRID: p.TRID, TargetStop: p.TargetStopID,
-				Prediction: viewOf(p),
-			})
+		if _, ok := s.preds.Latest(unit); ok {
+			all = append(all, s.vehicle(unit))
 		}
 	}
 	payload, err := json.Marshal(map[string]any{

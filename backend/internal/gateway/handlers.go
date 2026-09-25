@@ -176,7 +176,7 @@ func (s *Server) vehicles(w http.ResponseWriter, r *http.Request) {
 	units := s.cfg.Store.Units()
 	out := make([]vehicleView, 0, len(units))
 	for _, unit := range units {
-		out = append(out, s.vehicle(r, unit))
+		out = append(out, s.vehicle(unit))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"vehicles": out,
@@ -187,7 +187,13 @@ func (s *Server) vehicles(w http.ResponseWriter, r *http.Request) {
 // vehicle собирает карточку одной машины. Отсутствующие части заменяются
 // нулями с явными флагами, а не ошибкой: машина может быть известна расписанию
 // и не иметь ни одного пакета телеметрии, и это не поломка.
-func (s *Server) vehicle(_ *http.Request, unit uint32) vehicleView {
+//
+// Карточка одна и та же для REST и для ленты. Раньше лента несла отдельную
+// узкую форму, и это выглядело безобидно, пока поля не разъехались: карточка
+// из ленты не знала координат, а панели они нужны не меньше прогноза. Две
+// формы одной сущности разъезжаются всегда, а лента при этом ещё и молчит:
+// расхождение видно только глазами на карте.
+func (s *Server) vehicle(unit uint32) vehicleView {
 	v := vehicleView{UnitID: unit}
 	if s.cfg.Binding != nil {
 		if tr, ok := s.cfg.Binding.TRID(unit); ok {
@@ -242,7 +248,7 @@ func (s *Server) vehicleByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, s.vehicle(r, unit))
+	writeJSON(w, http.StatusOK, s.vehicle(unit))
 }
 
 // trajectory — GET /api/v1/vehicles/{id}/trajectory.

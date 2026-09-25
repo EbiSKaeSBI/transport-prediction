@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -142,6 +143,134 @@ func TestIncidentIsBroadcastImmediately(t *testing.T) {
 		}
 	}
 	t.Fatal("инцидент не дошёл за две секунды")
+}
+
+// Лента и REST отдают одну и ту же карточку. Панели нужны координаты и
+// скорость не меньше прогноза, а раньше лента несла отдельную узкую форму без
+// них: чтобы показать метку, клиент тянул каждую машину отдельным запросом на
+// каждый тик.
+func TestVehicleEventCarriesSameCardAsREST(t *testing.T) {
+	srv, s := wsServer(t)
+	conn := dialWS(t, srv)
+	waitClients(t, s.Hub(), 1)
+	readEvent(t, conn, 2*time.Second) // снимок инцидентов
+	readEvent(t, conn, 2*time.Second) // снимок машин
+
+	s.Observe(predictionAt(4242, 300, 0.95))
+
+	var fromFeed vehicleView
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ev := readEvent(t, conn, 500*time.Millisecond)
+		if ev.Type != EventVehicle {
+			continue
+		}
+		if err := json.Unmarshal(ev.Data, &fromFeed); err != nil {
+			t.Fatalf("карточка из ленты не разобрана: %v; сырое: %s", err, ev.Data)
+		}
+		break
+	}
+	if fromFeed.UnitID == 0 {
+		t.Fatal("карточка из ленты не дошла за две секунды")
+	}
+
+	// Телеметрия обязана быть в карточке, а не только в хранилище.
+	if !fromFeed.LocationValid || fromFeed.Latitude == 0 || fromFeed.Longitude == 0 {
+		t.Errorf("в карточке ленты нет координат: valid=%v lat=%g lon=%g",
+			fromFeed.LocationValid, fromFeed.Latitude, fromFeed.Longitude)
+	}
+	if fromFeed.SpeedKmh != 18 {
+		t.Errorf("скорость в карточке ленты %g, ожидалось 18", fromFeed.SpeedKmh)
+	}
+	if fromFeed.Risk == "" {
+		t.Error("в карточке ленты не заполнен уровень риска")
+	}
+	if fromFeed.Prediction == nil {
+		t.Fatal("в карточке ленты нет прогноза")
+	}
+	if fromFeed.Prediction.PredictedDevS != 300 {
+		t.Errorf("в карточке ленты отклонение %g, ожидалось 300",
+			fromFeed.Prediction.PredictedDevS)
+	}
+
+	// Главное свойство: карточка одна, иначе они со временем разъедутся, и
+	// разъезд заметят только глазами на карте.
+	//
+	// StalenessS исключён: это показание часов в момент чтения, а читают мы
+	// два раза, то есть сравниваем два разных момента. Значение честно
+	// расходится на микросекунды, и сравнивать его здесь нечего.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/vehicles/4242", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("REST карточки: код %d, ожидался 200; тело: %s", rec.Code, rec.Body)
+	}
+	var fromREST vehicleView
+	if err := json.Unmarshal(rec.Body.Bytes(), &fromREST); err != nil {
+		t.Fatalf("карточка из REST не разобрана: %v", err)
+	}
+	fromFeed.StalenessS, fromREST.StalenessS = 0, 0
+	if !reflect.DeepEqual(fromREST, fromFeed) {
+		t.Errorf("лента и REST отдали разные карточки:\nлента: %+v\nREST:  %+v", fromFeed, fromREST)
+	}
+}
+
+// В карточке из ленты должен лежать прогноз текущего тика, а не предыдущий.
+// Порядок preds.Put до publishVehicle в Observe это гарантирует, и проверка
+// нужна именно потому, что зависимость неявная: перестановка вызовов тихо
+// сдвигает карточку на тик назад, и это заметно только глазами.
+func TestVehicleEventCarriesCurrentPrediction(t *testing.T) {
+	s := testServer(t)
+	// Свои часы у ленты, а не wsServer: троттлинг не чаще раза в секунду на
+	// машину, и два наблюдения подряд на реальных часах превратили бы тест в
+	// гонку — то либо проходит, то нет, в зависимости от загрузки.
+	now := base
+	s.cfg.Hub = NewHub(HubConfig{
+		Queue: 8, DropLimit: 3,
+		VehicleInterval: time.Second,
+		MetricsInterval: time.Hour,
+		MetricsProvider: func() any { return map[string]any{"vehicles": 1} },
+		Now:             func() time.Time { return now },
+	})
+	srv := httptest.NewServer(s.Handler())
+	t.Cleanup(srv.Close)
+	t.Cleanup(s.cfg.Hub.Close)
+
+	conn := dialWS(t, srv)
+	waitClients(t, s.Hub(), 1)
+	readEvent(t, conn, 2*time.Second)
+	readEvent(t, conn, 2*time.Second)
+
+	s.Observe(predictionAt(4242, 100, 0.1))
+	first := vehicleFromFeed(t, conn)
+	if first.Prediction == nil || first.Prediction.PredictedDevS != 100 {
+		t.Fatalf("в первой карточке отклонение %+v, ожидалось 100", first.Prediction)
+	}
+
+	now = now.Add(2 * time.Second)
+	s.Observe(predictionAt(4242, 250, 0.9))
+	second := vehicleFromFeed(t, conn)
+	if second.Prediction == nil || second.Prediction.PredictedDevS != 250 {
+		t.Errorf("во второй карточке отклонение %+v, ожидалось 250", second.Prediction)
+	}
+}
+
+// vehicleFromFeed читает карточку машины из ленты, пропуская инциденты.
+func vehicleFromFeed(t *testing.T, conn *websocket.Conn) vehicleView {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ev := readEvent(t, conn, 500*time.Millisecond)
+		if ev.Type != EventVehicle {
+			continue
+		}
+		var v vehicleView
+		if err := json.Unmarshal(ev.Data, &v); err != nil {
+			t.Fatalf("карточка не разобрана: %v; сырое: %s", err, ev.Data)
+		}
+		return v
+	}
+	t.Fatal("карточка не дошла за две секунды")
+	return vehicleView{}
 }
 
 func TestVehicleEventsAreThrottled(t *testing.T) {
