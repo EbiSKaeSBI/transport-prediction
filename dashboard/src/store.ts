@@ -16,6 +16,8 @@ export class Store {
   meta: MetaEvent | null = null
   clock = 0
   framesTotal = 0
+  /** реплей доиграл до конца: часы не гоним, показываем бейдж */
+  streamEnded = false
   /** скользящая частота событий в секунду (по 1-секундным бакетам) */
   rate: RateBucket[] = []
 
@@ -42,26 +44,31 @@ export class Store {
         break
       }
       case 'frame': {
-        this.framesTotal++
         const f = ev as FrameEvent
         const v = this.vehicles.get(f.tr_id)
         if (v && (!v.lastFrame || f.ts >= v.lastFrame.ts)) {
+          this.framesTotal++ // только реально применённые кадры
           this.vehicles.set(v.tr_id, { ...v, lastFrame: f })
         }
         break
       }
       case 'incident': {
-        this.incidents.set(ev.id, { ...ev, acked: false })
+        // at-least-once доставка (live WS): повтор того же id не должен
+        // сбрасывать ack уже показанного инцидента
+        if (!this.incidents.has(ev.id)) this.incidents.set(ev.id, { ...ev, acked: false })
         break
       }
       case 'model': { this.model = ev as ModelEvent; break }
       case 'meta': { this.meta = ev as MetaEvent; break }
     }
     if (ev.ts > this.clock) this.clock = ev.ts
-    const sec = Math.floor(ev.ts)
+    let sec = Math.floor(ev.ts)
     const last = this.rate[this.rate.length - 1]
-    if (last && last.t === sec) last.n++
-    else {
+    if (last) {
+      if (sec < last.t) sec = last.t // неупорядоченные live-события не ломают окно
+      if (sec === last.t) last.n++
+    }
+    if (!last || sec !== last.t) {
       this.rate.push({ t: sec, n: 1 })
       if (this.rate.length > 120) this.rate.shift()
     }
@@ -71,8 +78,15 @@ export class Store {
 
   /** часы потока могут опережать последнее событие: stale-детекция живёт тут */
   tickClock(ts: number): void {
-    if (ts <= this.clock) return
+    if (this.streamEnded || ts <= this.clock) return
     this.clock = ts
+    this.rev++
+    for (const fn of this.listeners) fn()
+  }
+
+  noteStreamEnd(): void {
+    if (this.streamEnded) return
+    this.streamEnded = true
     this.rev++
     for (const fn of this.listeners) fn()
   }
@@ -89,7 +103,11 @@ export class Store {
     const n = this.rate.length
     if (!n) return 0
     const window = this.rate.slice(-10)
-    return window.reduce((s, b) => s + b.n, 0) / window.length
+    const total = window.reduce((s, b) => s + b.n, 0)
+    // делим на фактическую длительность окна, а не на число непустых секунд:
+    // на разреженном потоке (×1) честные доли события в секунду
+    const span = window[window.length - 1].t - window[0].t + 1
+    return total / span
   }
 
   activeVehicles(): number {

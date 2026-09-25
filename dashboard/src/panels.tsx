@@ -11,7 +11,12 @@ function useStoreRev(store: Store): number {
 
 export function Clock({ store }: { store: Store }) {
   useStoreRev(store)
-  return <span className="clock">{formatClock(store.clock)}</span>
+  return <span className="clock mono">{formatClock(store.clock)}</span>
+}
+
+export function StreamEndedBadge({ store }: { store: Store }) {
+  useStoreRev(store)
+  return store.streamEnded ? <span className="badge ended">поток завершён</span> : null
 }
 
 export function IncidentRail({ store, stopNames, live }: {

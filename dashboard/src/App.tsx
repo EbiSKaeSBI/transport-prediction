@@ -6,7 +6,7 @@ import MapView from './MapView'
 import type { RouteFC } from './geo'
 import { paintRoutes } from './geo'
 import CanvasMap from './CanvasMap'
-import { Clock, IncidentRail, MetricsPanel, ModelPanel, VehicleCard } from './panels'
+import { Clock, IncidentRail, MetricsPanel, ModelPanel, StreamEndedBadge, VehicleCard } from './panels'
 import './App.css'
 
 function hasWebGL(): boolean {
@@ -65,9 +65,10 @@ export default function App() {
       try {
         await s.start()
       } catch {
-        setError('Не удалось подключить источник потока')
+        if (mounted) setError('Не удалось подключить источник потока')
       }
-      if (mounted) setSource(s)
+      if (!mounted) { s.stop(); return } // unmount прилетел во время start()
+      setSource(s)
     })
     return () => { mounted = false; src?.stop() }
   }, [store])
@@ -85,6 +86,7 @@ export default function App() {
         <div className="controls">
           <Clock store={store} />
           <span className={`badge ${live ? 'live' : 'demo'}`}>{live ? 'live WS' : 'demo-реплей'}</span>
+          {!live && <StreamEndedBadge store={store} />}
           {!live && (
             <>
               <select value={rate} onChange={e => setRate(Number(e.target.value))} aria-label="скорость потока">
@@ -103,7 +105,7 @@ export default function App() {
             ? <MapView store={store} routes={routes} selected={selected} onSelect={setSelected} />
             : <CanvasMap store={store} routes={routes} selected={selected} onSelect={setSelected} />}
           <div className="legend">
-            <span><i style={{ background: '#2ecc71' }} /> ≤ 60 с</span>
+            <span><i style={{ background: '#2ecc71' }} /> &lt; 60 с</span>
             <span><i style={{ background: '#f1c40f' }} /> 60–120 с</span>
             <span><i style={{ background: '#e74c3c' }} /> ≥ 120 с (инцидент)</span>
             <span><i style={{ background: '#7f8c8d' }} /> нет свежей телеметрии</span>

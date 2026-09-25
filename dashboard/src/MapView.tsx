@@ -111,21 +111,29 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
     })
 
     let raf = 0
-    const unsub = store.subscribe(() => {
+    const redraw = () => {
       if (raf) return
       raf = requestAnimationFrame(() => {
         raf = 0
         const src = map.getSource('vehicles') as GeoJSONSource | undefined
         src?.setData(vehiclesFC(store.vehicles.values(), store.clock, selectedRef.current) as never)
       })
-    })
+    }
+    redrawRef.current = redraw
+    const unsub = store.subscribe(redraw)
+    redraw()
 
     return () => {
       if (raf) cancelAnimationFrame(raf)
+      if (redrawRef.current === redraw) redrawRef.current = () => {}
       unsub()
       map.remove()
     }
   }, [store, routes])
+
+  // смена выделения на паузе реплея: событий нет — перерисовать вручную
+  const redrawRef = useRef<() => void>(() => {})
+  useEffect(() => { redrawRef.current() }, [selected])
 
   return <div ref={holder} className="map-holder" />
 }

@@ -19,6 +19,14 @@ interface Props {
  */
 export default function CanvasMap({ store, routes, selected, onSelect }: Props) {
   const ref = useRef<HTMLCanvasElement | null>(null)
+  const selectedRef = useRef<number | null>(selected)
+  const onSelectRef = useRef(onSelect)
+  const redrawRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    selectedRef.current = selected
+    redrawRef.current() // кольцо выделения на паузе реплея
+  }, [selected])
+  useEffect(() => { onSelectRef.current = onSelect }, [onSelect])
 
   useEffect(() => {
     const canvas = ref.current
@@ -83,7 +91,7 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
       for (const v of store.vehicles.values()) {
         const [x, y] = project(v.lon, v.lat)
         const risk = vehicleRisk(v, store.clock)
-        if (v.tr_id === selected) {
+        if (selectedRef.current === v.tr_id) {
           ctx.strokeStyle = '#fff'; ctx.lineWidth = 2
           ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.stroke()
         }
@@ -101,18 +109,26 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
         const d = Math.hypot(x - px, y - py)
         if (d < bestD) { bestD = d; best = v.tr_id }
       }
-      onSelect(best)
+      onSelectRef.current(best)
     }
     canvas.addEventListener('click', onClick)
 
     draw()
-    const unsub = store.subscribe(() => { window.requestAnimationFrame(draw) })
+    let raf = 0 // коалесинг: пачка событий за тик реплея = одна перерисовка
+    const scheduled = () => {
+      if (raf) return
+      raf = window.requestAnimationFrame(() => { raf = 0; draw() })
+    }
+    redrawRef.current = scheduled
+    const unsub = store.subscribe(scheduled)
     return () => {
+      if (raf) window.cancelAnimationFrame(raf)
+      if (redrawRef.current === scheduled) redrawRef.current = () => {}
       window.removeEventListener('resize', resize)
       canvas.removeEventListener('click', onClick)
       unsub()
     }
-  }, [store, routes, selected, onSelect])
+  }, [store, routes])
 
   return <div className="map-holder canvas-mode"><canvas ref={ref} /><span className="canvas-badge">canvas-фолбэк (нет WebGL)</span></div>
 }

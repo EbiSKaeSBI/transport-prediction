@@ -60,8 +60,10 @@ def parse_time(value: str) -> datetime | None:
             dt = datetime.strptime(value, fmt)
         except ValueError:
             continue
-        if fmt.endswith("Z"):
-            return dt.replace(tzinfo=timezone.utc)
+        # Всё в датасете — наивные стенные часы МСК. Go в поле t кадра
+        # дописывает «Z» к тому же наивному времени без конвертации
+        # (проверено: epoch из sample_id == timegm(naive) для 1534/1534
+        # кадров), поэтому читаем Z-строки в ту же стенную ось.
         return dt.replace(tzinfo=MSK)
     return None
 
@@ -164,7 +166,17 @@ def load_frames() -> list[dict]:
                  "go run ./cmd/transportctl features --plan ../validate/schedule_plan.csv "
                  "--binding ../validate/traffic.csv --input ../validate/traffic.csv "
                  "--tick 5m --frames --out ../dashboard/public/demo/frames.jsonl")
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        f = json.loads(line)
+        t = parse_time(f.get("t", ""))
+        # кадры вне суточного окна в поток не попадают — иначе нарушается
+        # обещание «события упорядочены в рамках окна» из docs/dashboard.md
+        if t is not None and DAY_START <= t < DAY_END:
+            out.append(f)
+    return out
 
 
 def incident_reason(values: dict) -> str:
@@ -276,7 +288,12 @@ def main() -> int:
             "tr_id": f["tr_id"], "target_stop_id": f["target_stop_id"],
             "horizon_s": f["horizon_s"], "ambiguous": f.get("ambiguous", False),
             "cur_dev_s": cur_dev, "official": cur_dev is not None,
-            "values": f["values"],
+            # качество данных по features/v1.yaml (секция quality) идёт в
+            # values — панель «карточка ТС» показывает все контрактные фичи
+            "values": {**f["values"],
+                       "staleness_s": f.get("staleness_s"),
+                       "points_in_window": f.get("points_in_window"),
+                       "lag_s": f.get("lag_s")},
         })
     # инциденты — по официальной сетке точек: правило-фолбэк predicted = cur_dev_s
     for pt in points:

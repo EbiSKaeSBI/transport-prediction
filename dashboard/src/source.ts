@@ -41,6 +41,7 @@ export class ReplaySource implements DataSource {
   private rate = 60
   private paused = false
   private timer: number | null = null
+  private stopped = false
 
   private store: Store
   private url: string
@@ -51,7 +52,10 @@ export class ReplaySource implements DataSource {
   }
 
   async start(): Promise<void> {
-    this.events = await parseNdjson(this.url)
+    this.stopped = false
+    const events = await parseNdjson(this.url)
+    if (this.stopped) return // stop() пришёл, пока шёл fetch — не взводим таймер
+    this.events = events
     this.events.sort((a, b) => a.ts - b.ts)
     this.stream0 = this.events[0]?.ts ?? 0
     this.idx = 0
@@ -61,6 +65,7 @@ export class ReplaySource implements DataSource {
   }
 
   stop(): void {
+    this.stopped = true
     if (this.timer != null) window.clearInterval(this.timer)
     this.timer = null
   }
@@ -93,6 +98,12 @@ export class ReplaySource implements DataSource {
       this.store.apply(this.events[this.idx])
       this.idx++
       if (++applied >= 2000) break // защита от длинного синхронного фриза
+    }
+    if (this.idx >= this.events.length) {
+      // поток доигран: фиксируем часы (иначе ТС «постареют» в серое навсегда)
+      this.stop()
+      this.store.noteStreamEnd()
+      return
     }
     this.store.tickClock(targetTs)
   }
