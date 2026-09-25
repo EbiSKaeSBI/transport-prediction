@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Генерируется scripts/make_dashboard_demo.py — не коммитим
+public/demo/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
