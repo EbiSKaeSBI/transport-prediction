@@ -1,0 +1,35 @@
+// Шаблон лейаута разработки transport-prediction.
+// Не редактировать на месте: `make layout-install` подставляет @ROOT@ =
+// абсолютный путь репозитория и пишет готовый файл в
+// ~/.config/zellij/layouts/tpredict.kdl.
+// ВНИМАНИЕ: pane'ы внутри tab — плоский список (вложенные pane не парсятся
+// на zellij 0.45), команды вынесены в скрипты, т.к. args "..." в kdl ломает
+// парсер.
+layout {
+    default_tab_template {
+        pane size=1 borderless=true {
+            plugin location="zellij:tab-bar"
+        }
+        children
+        pane size=1 borderless=true {
+            plugin location="zellij:status-bar"
+        }
+    }
+    tab name="shell" {
+        pane name="shell" cwd="@ROOT@" command="@ROOT@/.zellij/run-shell.sh"
+    }
+    tab name="git" {
+        pane name="lazygit" cwd="@ROOT@" command="@ROOT@/.zellij/run-tui.sh"
+    }
+    tab name="log" {
+        pane name="backend" cwd="@ROOT@" command="@ROOT@/.zellij/run-backend.sh"
+        pane name="dashboard" cwd="@ROOT@/dashboard" command="@ROOT@/.zellij/run-dashboard.sh"
+        pane name="emulator" cwd="@ROOT@" command="@ROOT@/.zellij/run-emulator.sh"
+    }
+    tab name="docker" {
+        pane name="lazydocker" cwd="@ROOT@" command="@ROOT@/.zellij/run-docker.sh"
+    }
+    tab name="ai" {
+        pane name="repowise" cwd="@ROOT@" command="@ROOT@/.zellij/run-ai.sh"
+    }
+}

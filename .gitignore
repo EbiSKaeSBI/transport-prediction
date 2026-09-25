@@ -61,6 +61,9 @@ logs/
 # сервера перезаписывается и в git попадать не должен.
 observations.jsonl
 
+# Бинарник, собираемый `make build` (backend/transportctl) — артефакт сборки.
+backend/transportctl
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Dashboard (Node / Vite)
