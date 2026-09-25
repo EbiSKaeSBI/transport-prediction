@@ -22,6 +22,11 @@ def repo_root() -> Path:
 
 
 @pytest.fixture(scope='session')
+def artifacts_dir() -> Path:
+    return ML_DIR / 'artifacts'
+
+
+@pytest.fixture(scope='session')
 def features_train_path() -> Path:
     return ML_DIR / 'artifacts' / 'features_train.jsonl'
 
