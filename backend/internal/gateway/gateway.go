@@ -62,6 +62,15 @@ type Config struct {
 	LatencyWindow int
 	// Now подменяет часы в тестах. При nil time.Now.
 	Now func() time.Time
+	// Hub — лента событий. При nil гейтвей работает без WebSocket:
+	// /ws/stream отвечает закрытием сразу, а остальные эндпоинты не
+	// страдают. Отсутствие ленты не повод не поднимать сервер.
+	//
+	// Ленту нужно ещё запустить: Hub.Run(ctx) шлёт метрики по таймеру и
+	// закрывает подписчиков при остановке. Запуск остаётся на вызывающем,
+	// потому что конструктор, который сам поднимает горутину, не может её
+	// потом остановить.
+	Hub *Hub
 	// Logger при nil берётся slog.Default.
 	Logger *slog.Logger
 }
@@ -116,12 +125,22 @@ func New(cfg Config) *Server {
 //
 // Возвращает событие по инциденту, чтобы планировщик отправил в WebSocket
 // именно изменение, а не весь список инцидентов подряд.
+//
+// Наблюдение и есть главная работа гейтвея: обновляет карточку и двигает
+// жизненный цикл инцидента. Оба следствия уходят в ленту немедленно, и
+// инцидент — только когда он действительно изменился, иначе панель получала
+// бы событие на каждом тике ради цифры, которая не поменялась.
 func (s *Server) Observe(p predictor.Prediction) IncidentEvent {
 	s.preds.Put(p)
 	if p.Latency > 0 {
 		s.latency.ObserveDuration(p.Latency)
 	}
-	return s.incidents.Update(p)
+	ev := s.incidents.Update(p)
+	s.publishVehicle(p)
+	if ev.Incident != nil {
+		s.publishIncident(*ev.Incident)
+	}
+	return ev
 }
 
 // Handler возвращает корневой обработчик. Отдельный метод нужен, чтобы
@@ -132,6 +151,14 @@ func (s *Server) Handler() http.Handler { return s.mux }
 // тестах и для планировщика, который обязан знать, что инцидент открыт.
 func (s *Server) Incidents() *Incidents     { return s.incidents }
 func (s *Server) Predictions() *Predictions { return s.preds }
+
+// Hub возвращает ленту событий. Может быть nil, если гейтвей подняли без неё.
+func (s *Server) Hub() *Hub { return s.cfg.Hub }
+
+// Snapshot возвращает начальное состояние для нового подписчика. Отдельный
+// метод, потому что это ровно то, что нужно приборной панели при подключении,
+// и его полезно проверять тестом без поднятия WebSocket.
+func (s *Server) Snapshot() []Event { return s.snapshot() }
 
 // ListenAndServe принимает соединения до отмены ctx. Отмена ctx останавливает
 // сервер и дожидается текущих запросов: оборванный на середине ответ в

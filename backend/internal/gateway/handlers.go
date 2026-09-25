@@ -414,6 +414,10 @@ func (s *Server) ackIncident(w http.ResponseWriter, r *http.Request) {
 		// увел бы клиента искать несуществующий идентификатор.
 		writeJSON(w, http.StatusConflict, inc)
 	default:
+		// Подтверждение человеком — событие, которое другие должны увидеть
+		// сразу: дежурный сменился, и вторая смена обязана знать, что про
+		// этот простой уже знают.
+		s.publishIncident(inc)
 		writeJSON(w, http.StatusOK, inc)
 	}
 }

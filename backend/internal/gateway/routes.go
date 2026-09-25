@@ -18,6 +18,8 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /readyz", s.readiness)
 	m.HandleFunc("GET /metrics", s.metrics)
 
+	m.HandleFunc("GET /ws/stream", s.stream)
+
 	m.HandleFunc("GET /api/v1/vehicles", s.vehicles)
 	m.HandleFunc("GET /api/v1/vehicles/{id}", s.vehicleByID)
 	m.HandleFunc("GET /api/v1/vehicles/{id}/trajectory", s.trajectory)

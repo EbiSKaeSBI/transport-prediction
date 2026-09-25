@@ -76,6 +76,19 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 		counter("transport_gateway_prediction_latency_samples_total", "замеров латентности всего", lat.Total)
 	}
 
+	// Лента. Молчащая лента при живой панели выглядит как «всё спокойно»,
+	// поэтому число подписчиков и число отброшенных событий — не
+	// справочные, а сигнальные метрики.
+	if h := s.Hub(); h != nil {
+		hs := h.Stats()
+		value("transport_gateway_ws_clients", "подписчиков ленты событий", float64(hs.Clients))
+		counter("transport_gateway_ws_sent_total", "событий разослано за всё время", hs.Sent)
+		counter("transport_gateway_ws_dropped_total",
+			"событий отброшено как слишком частые", hs.Dropped)
+		counter("transport_gateway_ws_refused_total",
+			"подписчиков отключено за неспособность читать", hs.Refused)
+	}
+
 	value("transport_gateway_uptime_s", "сколько работает гейтвей",
 		s.now().Sub(s.startedAt).Seconds())
 	if !readyzOK(s.cfg) {
