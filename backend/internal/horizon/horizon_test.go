@@ -178,7 +178,7 @@ func TestPlanExpandsAmbiguousTargetIntoPair(t *testing.T) {
 	if !dec.Frame.Target[1].Alternative {
 		t.Error("второй вариант ничьи обязан помечаться как альтернативный")
 	}
-	if v, ok := dec.Frame.Values["target_ambiguous"]; !ok || v != 1 {
+	if v, ok := dec.Frame.Value("target_ambiguous"); !ok || v != 1 {
 		t.Errorf("target_ambiguous = %v (ok=%v), ожидалась 1", v, ok)
 	}
 }
@@ -212,62 +212,93 @@ func TestSampleIDIsDeterministic(t *testing.T) {
 }
 
 // Отсутствующий признак обязан остаться пропуском, а не превратиться в ноль:
-// иначе модель обучилась бы на подставных значениях.
-func TestNullFeaturesStayAbsentFromFrame(t *testing.T) {
+// иначе модель обучилась бы на подставленных значениях. При этом ключ в карте
+// обязан быть — иначе отличить «не измерено» от «выпало из контракта» нельзя.
+func TestNullFeaturesStayNullInFrame(t *testing.T) {
 	// values вызывается напрямую с пустым набором: ни один признак не
-	// вычислен, поэтому в карте обязаны остаться только те, что по контракту
-	// не nullable.
+	// вычислен, поэтому nullable-признаки обязаны лежать nil, а
+	// не nullable — получить своё настоящее значение.
 	empty := values(features.Set{}, 660)
 	for _, name := range FeatureNames() {
-		_, present := empty[name]
+		p, present := empty[name]
+		if !present {
+			t.Fatalf("признак %s отсутствует в карте как ключ", name)
+		}
 		if nullableFeature(name) {
-			if present {
-				t.Errorf("nullable признак %s не должен попадать в карту без данных", name)
+			if p != nil {
+				t.Errorf("nullable признак %s = %v, ожидался пропуск", name, *p)
 			}
 			continue
 		}
-		if !present {
-			t.Errorf("обязательный признак %s отсутствует в карте", name)
+		if p == nil {
+			t.Errorf("не nullable признак %s не должен быть пропуском", name)
 		}
 	}
-	if v := empty["is_terminal_stop"]; v != 0 {
-		t.Errorf("is_terminal_stop = %v, ожидался 0", v)
-	}
-	if v := empty["target_ambiguous"]; v != 0 {
-		t.Errorf("target_ambiguous = %v, ожидался 0", v)
-	}
-	if v := empty["horizon_s"]; v != 660 {
-		t.Errorf("horizon_s = %v, ожидалось 660", v)
+	for name, want := range map[string]float64{
+		"is_terminal_stop": 0, "target_ambiguous": 0, "horizon_s": 660,
+		"speed_current": 0, "dwell_current_s": 0, "consecutive_late_stops": 0,
+	} {
+		p := empty[name]
+		if p == nil || *p != want {
+			t.Errorf("%s = %v, ожидалось %v", name, p, want)
+		}
 	}
 }
 
-// Признаки из набора обязаны попадать в карту: молча пропавший признак
-// выглядел бы как «модель его не использует», и расхождение с обучением
-// обнаружилось бы только на скоринге.
+// Каждый объявленный признак обязан присутствовать в карте ключом. Значение
+// может быть nil — это пропуск, — но ключ обязан быть: отсутствие ключа
+// читается как «признак выпал из контракта», и сверка с именами признаков
+// модели начинает сравнивать список с тем, чего в кадре нет.
 func TestFrameValuesCoverAllNames(t *testing.T) {
 	stops := routeStops()
 	frame := New().Plan(request(stops, base, 1)).Frame
 	if frame == nil {
 		t.Fatal("кадр не построен")
 	}
-	missing := 0
 	for _, name := range FeatureNames() {
 		if _, ok := frame.Values[name]; !ok {
-			// Признак может быть пропущен, если он nullable и не вычислен.
-			if nullableFeature(name) {
-				continue
-			}
-			t.Errorf("не nullable признак %s отсутствует в карте", name)
-			missing++
+			t.Errorf("признак %s отсутствует в карте как ключ", name)
 		}
 	}
-	if missing > 0 {
-		t.Errorf("в карте не хватает %d обязательных признаков", missing)
-	}
-	if len(frame.Values) > len(FeatureNames()) {
-		t.Errorf("в карте %d признаков при %d объявленных: появились лишние",
+	if len(frame.Values) != len(FeatureNames()) {
+		t.Errorf("в карте %d признаков при %d объявленных: раскладка и список разошлись",
 			len(frame.Values), len(FeatureNames()))
 	}
+}
+
+// Missing перечисляет только пропуски и не путает их с нулём: нулевой
+// признак измерен, нулевой-по-неизвестности — нет.
+func TestMissingDistinguishesNilFromZero(t *testing.T) {
+	zero := 0.0
+	values := values(features.Set{
+		HeadwayS:             nil,
+		SpeedSegAvg:          &zero,
+		ConsecutiveLateStops: 3,
+	}, 700)
+
+	frame := Frame{Values: values}
+	if v, ok := frame.Value("speed_seg_avg"); !ok || v != 0 {
+		t.Errorf("speed_seg_avg = %v (ok=%v), ожидался измеренный ноль", v, ok)
+	}
+	if _, ok := frame.Value("headway_s"); ok {
+		t.Error("nil-признак должен считаться неизмеренным")
+	}
+	missing := frame.Missing()
+	if contains(missing, "speed_seg_avg") {
+		t.Error("нулевой признак не должен попадать в Missing")
+	}
+	if !contains(missing, "headway_s") {
+		t.Error("nil-признак обязан попадать в Missing")
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Цель позади по маршруту предсказывать бессмысленно: машина развернулась

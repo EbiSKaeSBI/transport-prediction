@@ -184,7 +184,7 @@ func replay(plan *schedule.Schedule, binding *schedule.Binding, tracks map[uint3
 			// после T. Конвейер так делать не может: это утечка.
 			result.curDevFuture++
 		}
-		curDev, ok := frame.Values["cur_dev_s"]
+		curDev, ok := frame.Value("cur_dev_s")
 		if !ok {
 			result.curDevMissing++
 			continue

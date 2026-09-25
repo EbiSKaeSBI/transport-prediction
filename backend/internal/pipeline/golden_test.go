@@ -107,17 +107,19 @@ func goldenHistory() []statestore.Point {
 // признаков не определён, поэтому признаки пишутся отсортированным списком:
 // иначе golden-тест ловил бы случайный порядок Go-карты.
 type goldenJSON struct {
-	SampleID   string             `json:"sample_id"`
-	UnitID     uint32             `json:"unit_id"`
-	TRID       int64              `json:"tr_id"`
-	AsOf       string             `json:"as_of"`
-	Ambiguous  bool               `json:"ambiguous"`
-	HorizonS   float64            `json:"horizon_s"`
-	Stops      []int64            `json:"target_variants"`
-	Features   map[string]float64 `json:"features"`
-	FeatureSet features.Set       `json:"feature_set"`
-	Quality    features.Quality   `json:"quality"`
-	Points     int                `json:"points_in_window"`
+	SampleID  string              `json:"sample_id"`
+	UnitID    uint32              `json:"unit_id"`
+	TRID      int64               `json:"tr_id"`
+	AsOf      string              `json:"as_of"`
+	Ambiguous bool                `json:"ambiguous"`
+	HorizonS  float64             `json:"horizon_s"`
+	Stops     []int64             `json:"target_variants"`
+	Features  map[string]*float64 `json:"features"`
+	// FeatureSet остаётся рядом: он показывает разницу между «не измерено»
+	// (null) и «ноль», и по нему видно, какие признаки Go не смог посчитать.
+	FeatureSet features.Set     `json:"feature_set"`
+	Quality    features.Quality `json:"quality"`
+	Points     int              `json:"points_in_window"`
 }
 
 func toGolden(t *testing.T, f *horizon.Frame) goldenJSON {

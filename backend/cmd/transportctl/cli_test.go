@@ -29,7 +29,7 @@ func testFrame() *horizon.Frame {
 			{ActionID: 114, Planned: planned, HorizonS: 630},
 			{ActionID: 1114, Planned: planned, HorizonS: 630, Alternative: true},
 		},
-		Values:   map[string]float64{"horizon_s": 630, "slack_s": -190.5},
+		Values:   map[string]*float64{"horizon_s": ptr(630.0), "slack_s": ptr(-190.5)},
 		Features: features.Set{IsTerminalStop: false, TargetAmbiguous: true},
 		Quality:  features.Quality{StalenessS: 0, PointsInWindow: 15, LagS: 0.25},
 		Window:   []statestore.Point{{UnitID: 4242}},
@@ -280,3 +280,7 @@ func TestRunPrintsUsageOnHelp(t *testing.T) {
 		t.Error("без аргументов обязана быть ошибка")
 	}
 }
+
+// ptr — адрес значения для карты признаков, где пропуск это nil, а не
+// отсутствие ключа.
+func ptr[T any](v T) *T { return &v }

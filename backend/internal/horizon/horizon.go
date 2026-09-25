@@ -8,6 +8,7 @@
 package horizon
 
 import (
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -125,9 +126,12 @@ type Frame struct {
 	// Target — варианты прибытия. При неоднозначной цели их два или
 	// больше, и все они равноправны.
 	Target []Arrival
-	// Values — признаки кадра. Отсутствующие признаки в map не попадают:
-	// модель обязана видеть пропуск, а не ноль.
-	Values map[string]float64
+	// Values — признаки кадра. Набор имён всегда равен FeatureNames(), а
+	// значение отсутствующего признака равно nil: пропуск должен доехать до
+	// модели пропуском. Раньше здесь был map[string]float64, и признак с
+	// nil-указателем просто не попадал в map — модель видела 17 колонок из
+	// 21 и не могла отличить «не измерено» от «ровно ноль».
+	Values map[string]*float64
 	// Features — полный набор признаков, включая те, что не ушли в модель.
 	Features features.Set
 	// Quality — секция качества данных.
@@ -284,38 +288,47 @@ func FormatSampleID(trID int64, t time.Time) string {
 	return SampleID(trID, t)
 }
 
-// values раскладывает набор признаков в карту для модели. Отсутствующие
-// признаки в карту не попадают: null должен оставаться пропуском, иначе модель
-// обучилась бы на подставных нулях.
+// values раскладывает набор признаков в карту для модели. Ключи здесь всегда
+// полные — ровно FeatureNames() — и пропуск лежит значением nil, а не
+// отсутствием ключа. Разница не косметическая: отсутствие ключа читатель
+// вынужден угадывать (неизвестно или ноль?), а nil читается однозначно и
+// сериализуется в JSON как null.
 //
 // horizon_s добавляется отдельно, потому что он не часть набора признаков Go,
 // а величина из секции given: фактический горизонт до выбранной цели. Он
 // никогда не nullable, и именно он ограничивает кадр окном (600, 900] с.
-func values(f features.Set, horizonS float64) map[string]float64 {
-	out := make(map[string]float64, 24)
+func values(f features.Set, horizonS float64) map[string]*float64 {
+	out := make(map[string]*float64, 24)
 	addF := func(name string, v *float64) {
 		if v != nil {
-			out[name] = *v
+			value := *v
+			out[name] = &value
+		} else {
+			out[name] = nil
 		}
 	}
 	addI := func(name string, v *int32) {
 		if v != nil {
-			out[name] = float64(*v)
+			value := float64(*v)
+			out[name] = &value
+		} else {
+			out[name] = nil
 		}
 	}
+	add := func(name string, v float64) { out[name] = &v }
 
 	addF("plan_travel_s", f.PlanTravelS)
 	addF("slack_s", f.SlackS)
 	addF("cur_dev_s", f.CurDevS)
 	addF("headway_s", f.HeadwayS)
 	addI("trip_index", f.TripIndex)
-	out["is_terminal_stop"] = boolF(f.IsTerminalStop)
-	out["manual_fill"] = boolF(f.ManualFill)
+	add("is_terminal_stop", boolF(f.IsTerminalStop))
+	add("manual_fill", boolF(f.ManualFill))
 
-	out["speed_current"] = f.SpeedCurrent
+	add("speed_current", f.SpeedCurrent)
 	addF("speed_seg_avg", f.SpeedSegAvg)
 	addF("speed_seg_max", f.SpeedSegMax)
-	out["dwell_current_s"] = f.DwellCurrentS
+	add("dwell_current_s", f.DwellCurrentS)
 	addF("dwell_last_s", f.DwellLastS)
 	addF("distance_to_target_m", f.DistanceToTargetM)
 	addI("stops_remaining", f.StopsRemaining)
@@ -323,9 +336,9 @@ func values(f features.Set, horizonS float64) map[string]float64 {
 	addF("route_progress", f.RouteProgress)
 	addF("layover_min", f.LayoverMin)
 	addF("drift_last3_slope", f.DriftLast3Slope)
-	out["consecutive_late_stops"] = float64(f.ConsecutiveLateStops)
-	out["target_ambiguous"] = boolF(f.TargetAmbiguous)
-	out["horizon_s"] = horizonS
+	add("consecutive_late_stops", float64(f.ConsecutiveLateStops))
+	add("target_ambiguous", boolF(f.TargetAmbiguous))
+	add("horizon_s", horizonS)
 
 	return out
 }
@@ -337,19 +350,50 @@ func boolF(v bool) float64 {
 	return 0
 }
 
+// featureNames — канонический набор признаков кадра. Это единственное место,
+// где он задан: values() раскладывает признаки по этому же списку, а тест
+// сверяет ключи кадра с ним. Раньше список жил отдельно от раскладки, и они
+// разошлись: раскладка молча теряла признаки с nil, а список обещал, что они
+// всегда есть. Из-за этого сверка с именами признаков модели, обязательная по
+// ADR 0002, сравнивала бы список с набором, которого в кадре нет.
+var featureNames = []string{
+	"plan_travel_s", "slack_s", "cur_dev_s", "headway_s", "trip_index",
+	"is_terminal_stop", "manual_fill",
+	"speed_current", "speed_seg_avg", "speed_seg_max",
+	"dwell_current_s", "dwell_last_s", "distance_to_target_m",
+	"stops_remaining", "heading_error_deg", "route_progress",
+	"layover_min", "drift_last3_slope", "consecutive_late_stops",
+	"target_ambiguous", "horizon_s",
+}
+
 // FeatureNames перечисляет признаки, которые гарантированно попадают в кадр.
-// Список нужен для сверки с моделью: признак, которого нет в обучении, но
-// который приехал в проде, молча игнорируется.
+// Гарантия теперь настоящая: ключи Frame.Values всегда равны этому списку,
+// а пропуск лежит значением nil. Список нужен для сверки с моделью — признак,
+// который есть в проде, но не в обучении, иначе игнорировался бы молча.
 func FeatureNames() []string {
-	return []string{
-		"plan_travel_s", "slack_s", "cur_dev_s", "headway_s", "trip_index",
-		"is_terminal_stop", "manual_fill",
-		"speed_current", "speed_seg_avg", "speed_seg_max",
-		"dwell_current_s", "dwell_last_s", "distance_to_target_m",
-		"stops_remaining", "heading_error_deg", "route_progress",
-		"layover_min", "drift_last3_slope", "consecutive_late_stops",
-		"target_ambiguous", "horizon_s",
+	return slices.Clone(featureNames)
+}
+
+// Value возвращает значение признака и признак того, что он измерен.
+// Отдельный метод, а не обращение к карте, потому что отсутствующий ключ и
+// nil — это разные вещи, и читатель обязан различать их явно.
+func (f Frame) Value(name string) (float64, bool) {
+	p, ok := f.Values[name]
+	if !ok || p == nil {
+		return 0, false
 	}
+	return *p, true
+}
+
+// Missing перечисляет признаки, которые в этом кадре не измерены.
+func (f Frame) Missing() []string {
+	var out []string
+	for _, name := range featureNames {
+		if p, ok := f.Values[name]; !ok || p == nil {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // HorizonS возвращает горизонт основной цели в секундах.
