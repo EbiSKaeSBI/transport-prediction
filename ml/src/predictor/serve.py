@@ -7,6 +7,10 @@ CLI (от корня репозитория)::
 
     python -m predictor.serve --model ml/artifacts/model_v1v3b.json --port 8000
 
+Если ``--port`` занят, сервис берёт следующий свободный (до
+``PORT_FALLBACK_ATTEMPTS`` попыток вверх) и печатает, какой порт в итоге, —
+см. :func:`bind_first_free`.
+
 Без ``--model`` (или с ``--no-model``), а также если загрузка артефакта
 на старте упала — сервис стартует в fallback-режиме (§4.7: «Модель не
 загрузилась → правило pred = cur_dev_s с явной пометкой»), HTTP всё равно 200.
@@ -48,6 +52,7 @@ replay-генератором); у fallback-ответа ``null``: объясн�
 from __future__ import annotations
 
 import argparse
+import socket
 import sys
 import threading
 import time
@@ -74,6 +79,13 @@ from predictor.features import to_matrix
 
 #: Окно скользящих замеров латентности инференса для квантилей /metrics.
 LATENCY_WINDOW = 2048
+
+#: Сколько портов вверх от запрошенного перебирает :func:`bind_first_free`.
+PORT_FALLBACK_ATTEMPTS = 10
+
+
+class PortUnavailableError(RuntimeError):
+    """Запрошенный порт и все кандидаты вверх заняты — сервис не стартует."""
 
 #: Имена фич, у которых есть выделенное поле запроса (не лежат в extras).
 _DEDICATED_FIELDS = ('sample_id', 'cur_dev_s', 'horizon_s')
@@ -485,6 +497,41 @@ def create_app(model_path: str | Path | None = None,
     return app
 
 
+def bind_first_free(host: str, port: int,
+                    attempts: int = PORT_FALLBACK_ATTEMPTS) -> tuple[socket.socket, int]:
+    """Вернуть LISTEN-сокет первого свободного порта от ``port`` вверх.
+
+    Порт занят (второй инстанс, не убитый после прошлого прогона сервер) —
+    сервис стартует на следующем порту вместо падения с
+    ``address already in use``. Сокет биндится и переводится в listen здесь
+    же и передаётся uvicorn напрямую: между «проверили, свободно» и
+    «забиндили» не остаётся окна, в которое порт мог бы перехватить другой
+    процесс (TOCTOU-гонка), — проверка привязкой честнее пингов вроде
+    ``connect_ex``.
+    """
+    last_err: OSError | None = None
+    for candidate in range(port, port + attempts):
+        # getaddrinfo вместо жёсткого AF_INET: работает и с IPv6-хостами,
+        # и с 'localhost', который на части машин резолвится в ::1.
+        family, socktype, proto, _, sockaddr = socket.getaddrinfo(
+            host, candidate, type=socket.SOCK_STREAM)[0]
+        sock = socket.socket(family, socktype, proto)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(sockaddr)
+        except OSError as err:
+            last_err = err
+            sock.close()
+            continue
+        sock.listen(2048)
+        sock.setblocking(False)
+        return sock, candidate
+    raise PortUnavailableError(
+        f'порты {port}..{port + attempts - 1} заняты '
+        f'(последняя ошибка: {last_err}); '
+        f'освободите порт или поднимите --port выше')
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description='ML-сервис predictor.serve (FastAPI, §4.5)')
     ap.add_argument('--model', default=None, help='путь к model_v1*.json (без него — fallback)')
@@ -492,14 +539,29 @@ def main(argv: list[str] | None = None) -> int:
                     help='путь к model_*_late.json: парный P(late)-классификатор (v4)')
     ap.add_argument('--no-model', action='store_true', help='стартить сразу в fallback-режиме')
     ap.add_argument('--host', default='0.0.0.0')
-    ap.add_argument('--port', type=int, default=8000)
+    ap.add_argument('--port', type=int, default=8000,
+                    help=f'запросить порт; если занят — взять следующий '
+                         f'(до {PORT_FALLBACK_ATTEMPTS} попыток)')
     args = ap.parse_args(argv)
 
     import uvicorn
 
+    try:
+        sock, actual_port = bind_first_free(args.host, args.port)
+    except PortUnavailableError as err:
+        print(f'[predictor.serve] {err}', file=sys.stderr)
+        return 1
+    if actual_port != args.port:
+        print(f'[predictor.serve] порт {args.port} занят, беру {actual_port} '
+              f'(--port {actual_port}; Go-гейтвэй тоже смотреть на :{actual_port})',
+              flush=True)
+
     model = None if (args.no_model or args.model is None) else args.model
-    uvicorn.run(create_app(model, args.late_model), host=args.host, port=args.port,
-                log_level='info')
+    server = uvicorn.Server(uvicorn.Config(create_app(model, args.late_model),
+                                           log_level='info'))
+    # sockets= вместо host/port: uvicorn работает на уже забинденном нами
+    # сокете, поэтому порт из сообщения выше гарантированно тот же самый.
+    server.run(sockets=[sock])
     return 0
 
 

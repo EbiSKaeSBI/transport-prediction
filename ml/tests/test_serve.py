@@ -8,12 +8,13 @@ predictions_validate_v3b.csv (тот же пайплайн через общую
 from __future__ import annotations
 
 import csv
+import socket
 
 import polars as pl
 import pytest
 from fastapi.testclient import TestClient
 
-from predictor.serve import create_app
+from predictor.serve import PortUnavailableError, bind_first_free, create_app
 
 MODEL_V3B = 'model_v1v3b.json'
 MODEL_V3C = 'model_v1v3c.json'
@@ -203,3 +204,37 @@ class TestInfoAndMetrics:
         assert 'predictor_model_loaded 1' in body
         assert 'predictor_invalid_requests_total 1' in body
         assert 'predictor_requests_total{endpoint="/predict"} 6' in body
+
+
+#: Сокеты, занимающие порты для тестов фолбэка (держим живыми до конца
+#: сессии: GC закрыл бы fd и порт освободился бы под носом у теста).
+_OCCUPANTS: list[socket.socket] = []
+
+
+def _occupied_port() -> int:
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(('127.0.0.1', 0))  # ОС выдаст реальный занятой порт
+    blocker.listen(1)
+    _OCCUPANTS.append(blocker)
+    return blocker.getsockname()[1]
+
+
+class TestPortFallback:
+    """bind_first_free: занятый порт -> следующий свободный, всё занято -> ошибка."""
+
+    def test_busy_port_shifts_to_next_free(self):
+        port = _occupied_port()
+        sock, actual = bind_first_free('127.0.0.1', port)
+        try:
+            assert port < actual <= port + 9  # сдвиг вверх в пределах attempts
+            assert sock.getsockname()[1] == actual  # привязан ровно к названному
+            # сокет реально в listen: TCP-хендшейк проходит в backlog
+            probe = socket.create_connection(('127.0.0.1', actual), timeout=1)
+            probe.close()
+        finally:
+            sock.close()
+
+    def test_all_busy_raises(self):
+        port = _occupied_port()
+        with pytest.raises(PortUnavailableError):
+            bind_first_free('127.0.0.1', port, attempts=1)  # только занятой кандидат
