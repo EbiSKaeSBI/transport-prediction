@@ -15,6 +15,7 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=8.3",
     "ruff>=0.8",
 ]
@@ -29,6 +30,11 @@ packages = ["src/predictor"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+# Naive стенное МСК без поясов — осознанное решение по данным (ADR 0004,
+# features/v1.yaml, ловушка суффикса Z): «datetime без tzinfo» здесь не баг.
+ignore = ["DTZ"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

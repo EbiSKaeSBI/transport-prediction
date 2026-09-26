@@ -95,7 +95,7 @@ README утверждает, что baseline даёт ≈ 0.40 — это **не
 | Наблюдаемость | `/metrics` (Prometheus) + панель latency прямо в дашборде | критерий 5 |
 | Образы | `scratch`/distroless для Go, `python:3.12-slim` для ML | предсказуемый холодный старт, малый размер |
 
-**GPU — опционально.** Флаг `--device cuda` в обучении, inference всегда CPU. Если CUDA-драйвера нет, `make train` отрабатывает на CPU, демо не ломается.
+**GPU — опционально.** Флаг `--device cuda` в обучении, inference всегда CPU. Если CUDA-драйвера нет, `make ml-train` отрабатывает на CPU, демо не ломается.
 
 ---
 

@@ -6,10 +6,17 @@
 попадают в prediction-path. Используется только как измерительный прибор.
 
 Запуск:  python3 scripts/oracle_audit.py
+Скоринг предсказаний модели по оракулу (раз за разом, на одной и той же
+выборке строк — сравнение v1/v1b/baseline честное по построению):
+    python3 scripts/oracle_audit.py \
+        --predictions ml/artifacts/predictions_validate.csv \
+        --predictions ml/artifacts/predictions_validate_b.csv
+Файл: sample_id;prediction (или ,).
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import statistics
@@ -32,6 +39,20 @@ def md5(path: Path) -> str:
 def read_csv(path: Path, delimiter: str = ",") -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle, delimiter=delimiter))
+
+
+def detect_delimiter(path: Path) -> str:
+    head = path.open(encoding="utf-8", errors="replace").readline()
+    return ";" if head.count(";") > head.count(",") else ","
+
+
+def read_predictions(path: Path) -> dict[str, float]:
+    """CSV вида sample_id;prediction -> {sample_id: float} (разделитель авто)."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle, delimiter=detect_delimiter(path)))
+    if not rows or not {"sample_id", "prediction"} <= set(rows[0]):
+        raise SystemExit(f"{path}: ожидаются колонки sample_id, prediction")
+    return {r["sample_id"]: float(r["prediction"]) for r in rows}
 
 
 def parse_ts(value: str) -> datetime:
@@ -187,7 +208,35 @@ def validate_report(points: list[dict[str, str]], truth: dict[str, float]) -> No
     print("  значение таргета предсказывать напрямую тяжело. Рабочая цель — дельта.")
 
 
+def score_predictions(
+    points: list[dict[str, str]], truth: dict[str, float], paths: list[Path]
+) -> None:
+    section("5. МОДЕЛЬНЫЕ ПРЕДСКАЗАНИЯ ЧЕРЕЗ ОРАКУЛ (одна и та же выборка строк)")
+    preds = {p: read_predictions(p) for p in paths}
+    # общая выборка: точка есть в оракуле и во ВСЕХ файлах — сравнение
+    # v1/v1b/baseline apple-to-apple, без расхождения покрытия.
+    common = sorted(set(truth) & set.intersection(*[set(d) for d in preds.values()]))
+    by_sid = {p["sample_id"]: p for p in points}
+    print(f"  точек в оракуле: {len(truth)} | в сравнении: {len(common)}")
+    mae_zero = mae([(0.0, truth[s]) for s in common])
+    pairs_base = [(float(by_sid[s]["cur_dev_s"]), truth[s]) for s in common]
+    rows = [("baseline cur_dev_s (чистый)", mae(pairs_base))]
+    for path, table in preds.items():
+        rows.append((str(path), mae([(table[s], truth[s]) for s in common])))
+    width = max(len(name) for name, _ in rows)
+    for name, value in rows:
+        score = max(0.0, 1 - value / mae_zero)
+        print(f"  MAE {name:<{width}} {value:7.2f} с   score = {score:.4f}")
+    print(f"  (mae_zero на общей выборке: {mae_zero:.2f} с)")
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(description='Локальный оракул: утечка, MAE, скоринг предсказаний')
+    ap.add_argument('--predictions', type=Path, action='append', default=[],
+                    metavar='FILE',
+                    help='CSV предсказаний sample_id;prediction — оценить по оракулу '
+                         '(можно несколько раз: v1, v1b, ...)')
+    args = ap.parse_args()
     if not (ROOT / "validate" / "points.csv").exists():
         print(
             "Не найден validate/points.csv — запускайте из корня репозитория.",
@@ -199,6 +248,8 @@ def main() -> int:
     cross_check(truth)
     baselines()
     validate_report(points, truth)
+    if args.predictions:
+        score_predictions(points, truth, args.predictions)
     print()
     return 0
 

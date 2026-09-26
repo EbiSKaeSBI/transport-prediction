@@ -12,13 +12,19 @@ SESSION := tpredict
 LAYOUT  := tpredict
 # юниты для конфига эмулятора (id:интервал_мс), id взяты из train/traffic.csv
 EMU_UNITS ?= --unit 664030:3000 --unit 794446:3000
+# таргет обучения predictor: abs — target_delay_s (v1/v1b/v2), delta —
+# delay_delta_s + сборка cur_dev+дельта (v3, §5.1 architecture.md)
+ML_TARGET ?= abs
+# артефакт для ML-сервиса (make ml-serve); пусто — fallback-режим cur_dev_s (§4.7)
+ML_MODEL ?= ml/artifacts/model_v1v3b.json
+ML_PORT ?= 8000
 
 .DEFAULT_GOAL := help
 
 .PHONY: help setup ml-setup build test lint fmt clean \
         dev attach stop status layout-install \
         serve dashboard emu-extract emu-up emu-config emu-down emu-logs \
-        submission audit capture
+        submission audit ml-train ml-serve ml-predict-validate capture ml-datasets
 
 help: ## показать список целей
 	@echo "transport-prediction — доступные команды:"
@@ -132,3 +138,46 @@ submission: ## собрать submission.csv из train/validate
 
 audit: ## аудит датасета на утечки и базовые MAE
 	python3 scripts/oracle_audit.py
+
+# ── ML-пайплайн (этап 3: CatBoost v1) ────────────────────────────────────
+
+ml-datasets: ## собрать датасеты parquet (replay-кадры должны быть в ml/artifacts/*.jsonl)
+	# Go-реплей (make ml-replay / capture) уже выполнен — только python-склейка.
+	# Профиль скорости для speed_deficit_ratio_5m всегда из train/traffic.csv.
+	ml/.venv/bin/python -m predictor.dataset \
+		--frames ml/artifacts/features_train.jsonl \
+		--traffic train/traffic.csv --schedule train/schedule.csv \
+		--labels labels/labels_train.csv \
+		--profile train/traffic.csv \
+		--out ml/artifacts/dataset_train.parquet
+	ml/.venv/bin/python -m predictor.dataset \
+		--frames ml/artifacts/features_test.jsonl \
+		--traffic test/traffic.csv --schedule test/schedule.csv \
+		--labels labels/labels_test.csv \
+		--profile train/traffic.csv \
+		--out ml/artifacts/dataset_test.parquet
+	ml/.venv/bin/python -m predictor.dataset \
+		--frames ml/artifacts/features_validate.jsonl \
+		--traffic validate/traffic.csv --schedule validate/schedule_plan.csv \
+		--labels validate/points.csv --labels-join left \
+		--profile train/traffic.csv \
+		--out ml/artifacts/dataset_validate.parquet
+
+ml-train: ## обучить CatBoost на датасетах (ML_TARGET=abs|delta, по умолчанию abs)
+	ml/.venv/bin/python -m predictor.train \
+		--train ml/artifacts/dataset_train.parquet \
+		--holdout ml/artifacts/dataset_test.parquet \
+		--out-dir ml/artifacts \
+		--target $(ML_TARGET)
+
+ml-serve: ## поднять ML-сервис FastAPI :$(ML_PORT) (ML_MODEL= — fallback-режим cur_dev_s)
+	cd ml && .venv/bin/python -m predictor.serve \
+		$(if $(ML_MODEL),--model $(ROOT)/$(ML_MODEL),--no-model) \
+		--host 127.0.0.1 --port $(ML_PORT)
+
+ml-predict-validate: ## прогнать v1 по validate и собрать submission.csv
+	ml/.venv/bin/python -m predictor.predict \
+		--model ml/artifacts/model_v1.json \
+		--dataset ml/artifacts/dataset_validate.parquet \
+		--out ml/artifacts/predictions_validate.csv
+	python3 scripts/make_submission.py --model ml/artifacts/predictions_validate.csv
