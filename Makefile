@@ -17,6 +17,9 @@ EMU_UNITS ?= --unit 664030:3000 --unit 794446:3000
 ML_TARGET ?= abs
 # артефакт для ML-сервиса (make ml-serve); пусто — fallback-режим cur_dev_s (§4.7)
 ML_MODEL ?= ml/artifacts/model_v1online.json
+#: Парный P(late)-классификатор (v4). Пусти ML_LATE_MODEL= — сервис
+#: работает без головы вероятностей, p_late в ответах остаётся null.
+ML_LATE_MODEL ?= ml/artifacts/model_v1online_late.json
 ML_PORT ?= 8000
 
 .DEFAULT_GOAL := help
@@ -170,9 +173,18 @@ ml-train: ## обучить CatBoost на датасетах (ML_TARGET=abs|delt
 		--out-dir ml/artifacts \
 		--target $(ML_TARGET)
 
+ml-train-late: ## обучить P(late)-классификатор для той же матрицы, что и ML_MODEL (v4)
+	ml/.venv/bin/python -m predictor.late \
+		--train ml/artifacts/dataset_train.parquet \
+		--holdout ml/artifacts/dataset_test.parquet \
+		--metrics ml/artifacts/metrics_$(patsubst model_%,%,$(basename $(notdir $(ML_MODEL)))).json \
+		--out-dir ml/artifacts \
+		--tag $(patsubst model_%,%,$(basename $(notdir $(ML_MODEL))))
+
 ml-serve: ## поднять ML-сервис FastAPI :$(ML_PORT) (ML_MODEL= — fallback-режим cur_dev_s)
 	cd ml && .venv/bin/python -m predictor.serve \
 		$(if $(ML_MODEL),--model $(ROOT)/$(ML_MODEL),--no-model) \
+		$(if $(wildcard $(ML_LATE_MODEL)),--late-model $(ROOT)/$(ML_LATE_MODEL),) \
 		--host 127.0.0.1 --port $(ML_PORT)
 
 ml-predict-validate: ## прогнать v1 по validate и собрать submission.csv

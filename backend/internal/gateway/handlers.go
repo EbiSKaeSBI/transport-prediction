@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,6 +154,7 @@ type predictionView struct {
 	DeltaS        float64          `json:"delta_s"`
 	PredictedDevS float64          `json:"predicted_dev_s"`
 	PLate         float64          `json:"p_late"`
+	Reason        string           `json:"reason,omitempty"`
 	Source        predictor.Source `json:"source"`
 	Stale         bool             `json:"stale"`
 	ModelVersion  string           `json:"model_version,omitempty"`
@@ -170,6 +172,7 @@ func viewOf(p predictor.Prediction) predictionView {
 		DeltaS:        p.DeltaS,
 		PredictedDevS: p.PredictedDevS,
 		PLate:         p.PLate,
+		Reason:        p.Reason,
 		Source:        p.Source,
 		Stale:         p.Stale,
 		ModelVersion:  p.ModelVersion,
@@ -578,6 +581,83 @@ func (req predictRequest) value(name string) (float64, bool) {
 		return 0, false
 	}
 	return *p, true
+}
+
+// metricsLatency — GET /api/v1/metrics/latency (§4.4): п50/p95/p99,
+// пропускная способность и глубина очереди в JSON.
+//
+// /metrics написан для Prometheus, этот эндпоинт — для дашборда: разбирать
+// текстовый exposition в браузере означало бы удвоить формат без единого
+// теста, сверяющего половины. Числа те же самые, откуда их берёт /metrics:
+// окно прогноза у гейтвея, окно инференции у клиента модели, снимок очереди
+// у планировщика — всё через замыкания из Config.
+//
+// Пустые окна из ответа выкидываются, а не заполняются нулями: ноль в поле
+// p50 читается как «быстро», тогда как правда — «ещё ни одного замера».
+func (s *Server) metricsLatency(w http.ResponseWriter, _ *http.Request) {
+	uptime := s.now().Sub(s.startedAt).Seconds()
+	out := map[string]any{"uptime_s": uptime}
+	if lat := s.latency.Snapshot(); lat.Total > 0 {
+		out["prediction_latency"] = lat
+		// Сквозная пропускная способность прогнозов — среднее за время
+		// работы, а не мгновенная скорость: панель проверяет ею порядок
+		// («тысяч кадров в минуту не ждём»), а не динамику, для динамики
+		// есть лента событий.
+		if uptime > 0 {
+			out["throughput"] = map[string]any{
+				"predictions_total": lat.Total,
+				"predictions_per_s": float64(lat.Total) / uptime,
+				"inference_per_s":   0.0, // заполняется ниже, если есть инференция
+			}
+		}
+	}
+	if s.cfg.Inference != nil {
+		if inf := s.cfg.Inference(); inf.Total > 0 {
+			out["inference_latency"] = inf
+			if tp, ok := out["throughput"].(map[string]any); ok {
+				tp["inference_per_s"] = float64(inf.Total) / uptime
+			}
+		}
+	}
+	if s.cfg.Queue != nil {
+		out["queue"] = s.cfg.Queue()
+	}
+	if h := s.Hub(); h != nil {
+		hs := h.Stats()
+		out["stream"] = map[string]any{
+			"clients":       hs.Clients,
+			"sent_total":    hs.Sent,
+			"dropped_total": hs.Dropped,
+		}
+	}
+	if units := s.knownUnits(); len(units) > 0 {
+		out["vehicles_known"] = len(units)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// modelMeta — GET /api/v1/model: паспорт модели из её /model/info через
+// прокси гейтвея.
+//
+// Прокси, а не запрос панели прямо к сервису модели: адрес ml-core знает
+// только гейтвей (--ml), в проде у браузера его может не быть (сеть контейнеров),
+// и один вход для всей панели сохраняет правило «дашборд общается с гейтвеем».
+// Результат не кэшируется: /model/reload меняет версию на лету, и кэш показал
+// бы панелью вчерашнюю модель.
+func (s *Server) modelMeta(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.ML == nil {
+		writeError(w, http.StatusServiceUnavailable, "model_unavailable",
+			"клиент модели не подключён — прогнозы считаются baseline'ом, паспорта модели нет")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	info, err := s.cfg.ML.ModelInfo(ctx)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "model_unreachable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
 }
 
 // parseUnitID достаёт unit_id из пути. Ошибка с примером формата обязательна:

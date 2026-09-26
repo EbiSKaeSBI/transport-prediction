@@ -101,6 +101,53 @@ func TestRepeatedRedUpdatesSameIncident(t *testing.T) {
 	}
 }
 
+// Причина живёт по своим правилам: обновление без причины (fallback/baseline)
+// не должно стирать последнее объяснение, а принесённая новая — обязана
+// перезаписать. Иначе при деградации модели карточка станет пустой ровно
+// тогда, когда оператор в неё смотрит.
+func TestIncidentReasonLifecycle(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+
+	open := predictionAt(4242, 200, 0.9)
+	open.Reason = "низкая скорость движения"
+	ev := s.Update(open)
+	if ev.Incident == nil || ev.Incident.Reason != open.Reason {
+		t.Fatalf("причина не попала в открытый инцидент: %+v", ev.Incident)
+	}
+
+	silent := predictionAt(4242, 240, 0.95) // причина не пришла: модель деградировала
+	ev = s.Update(silent)
+	if ev.Incident.Reason != open.Reason {
+		t.Errorf("пустая причина стёрла объяснение: %q", ev.Incident.Reason)
+	}
+
+	next := predictionAt(4242, 250, 0.95)
+	next.Reason = "малый интервал, эффект «паровозика»"
+	ev = s.Update(next)
+	if ev.Incident.Reason != next.Reason {
+		t.Errorf("новая причина не перезаписала старую: %q", ev.Incident.Reason)
+	}
+}
+
+// Плановый сосед цели доезжает до карточки, а без расписания поля просто
+// нет (omitempty) — отсутствие участка честнее выдуманного.
+func TestIncidentPrevStopFromLookup(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+	// predictionAt: TRID 7, цель 114; план tr 7: … → 113 → 114.
+	s.SetScheduleLookup(func(trID, target int64) int64 {
+		if trID == 7 && target == 114 {
+			return 113
+		}
+		return 0
+	})
+	ev := s.Update(predictionAt(4242, 200, 0.9))
+	if ev.Incident == nil || ev.Incident.PrevStopID != 113 {
+		t.Fatalf("prev_stop_id не проставился: %+v", ev.Incident)
+	}
+}
+
 func TestIncidentResolvesWhenRiskFalls(t *testing.T) {
 	s := NewIncidents(0)
 	s.now = func() time.Time { return base }

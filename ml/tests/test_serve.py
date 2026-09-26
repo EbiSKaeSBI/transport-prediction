@@ -83,9 +83,13 @@ class TestPredictHappyPath:
         # predictions_validate_v3b.csv округлён до 3 знаков (round в predict.py)
         assert body['delay_s'] == pytest.approx(v3b_predictions[req['sample_id']], abs=1e-3)
         assert body['horizon_min'] == pytest.approx(req['horizon_s'] / 60.0)
-        # классификатор P(late) — только v4/#9; reason строит Go-шлюз
+        # Без --late-model парной головы нет: p_late остаётся честным null
+        # (пороги риска gateway тогда работают только по секундам). reason
+        # — правила по значениям кадра (predictor.late.infer_reason), для
+        # ответа модели считаются всегда, от классификатора не зависят.
         assert body['p_late'] is None and body['p_ontime'] is None
-        assert body['p_early'] is None and body['reason'] is None
+        assert body['p_early'] is None
+        assert isinstance(body['reason'], str) and body['reason']
 
     def test_batch_of_three(self, client_model, validate_rows, v3b_features, v3b_predictions):
         reqs = [make_request(r, v3b_features) for r in validate_rows[:3]]

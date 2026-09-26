@@ -88,6 +88,37 @@ func TestPredictRequestIsFlatWire(t *testing.T) {
 	}
 }
 
+// TestModelInfoServesPassportDespiteContractMismatch — паспорт модели панель
+// должна видеть и когда контракт расходился: именно в этот момент человек
+// идёт в дашборд разбираться, какая версия что объявляет. Сверку имён
+// делает fetchInfoChecked на пути прогноза, а не чтение /model/info.
+func TestModelInfoServesPassportDespiteContractMismatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/model/info" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"version": "vTest", "features": []string{"совсем_не_те"}, "feature_count": 1,
+			"trained_at": "2026-09-26T13:06:23Z",
+			"mae":        map[string]float64{"mae_holdout_model": 68.28},
+		})
+	}))
+	defer srv.Close()
+
+	info, err := NewMLClient(MLConfig{BaseURL: srv.URL}).ModelInfo(t.Context())
+	if err != nil {
+		t.Fatalf("ModelInfo отказал: %v — сверка имён здесь не его работа", err)
+	}
+	if info.Version != "vTest" || info.TrainedAt != "2026-09-26T13:06:23Z" {
+		t.Errorf("паспорт криво разобран: %+v", info)
+	}
+	if info.MAE["mae_holdout_model"] != 68.28 {
+		t.Errorf("mae = %v, хотим метрики как их объявил сервис", info.MAE)
+	}
+}
+
 func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 	var predicts atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +129,7 @@ func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 			predicts.Add(1)
 			_ = json.NewEncoder(w).Encode(predictResponse{
 				DelayS: ptr(90.0), PLate: ptr(0.4), ModelVersion: "v1",
+				Reason: "длительный простой на остановке",
 			})
 		default:
 			http.NotFound(w, r)
@@ -119,6 +151,9 @@ func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 	}
 	if p.PLate != 0.4 {
 		t.Errorf("p_late %v, ожидалось 0.4", p.PLate)
+	}
+	if p.Reason != "длительный простой на остановке" {
+		t.Errorf("reason %q — причина из ответа должна доживать до Prediction", p.Reason)
 	}
 	if p.ModelVersion != "v1" {
 		t.Errorf("версия модели %q", p.ModelVersion)
@@ -236,6 +271,29 @@ func TestPLateOutOfRangeIsFailure(t *testing.T) {
 	c := NewMLClient(MLConfig{BaseURL: srv.URL, Retries: ptr(0)})
 	if _, err := c.predict(t.Context(), frameAt(t, base, 0)); err == nil {
 		t.Fatal("p_late вне [0,1] обязан быть отказом")
+	}
+}
+
+// Причина приходит текстом из внешнего мира, и слишком длинную подрезаем по
+// руне: обрезка посреди UTF-8 вывела бы кракозябры на карточке дашборда.
+func TestLongReasonTrimmedByRune(t *testing.T) {
+	long := strings.Repeat("проверка ", 500)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/model/info" {
+			_ = json.NewEncoder(w).Encode(modelInfoBody())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), Reason: long})
+	}))
+	defer srv.Close()
+
+	c := NewMLClient(MLConfig{BaseURL: srv.URL, Retries: ptr(0)})
+	p := c.Predict(t.Context(), frameAt(t, base, 0))
+	if n := len([]rune(p.Reason)); n != 160 {
+		t.Errorf("длина причины %d рун, ожидалось 160", n)
+	}
+	if !strings.HasPrefix(p.Reason, "проверка") {
+		t.Errorf("обрезка исказила начало строки: %q", p.Reason[:20])
 	}
 }
 

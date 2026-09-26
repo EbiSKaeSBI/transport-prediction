@@ -133,6 +133,21 @@ func New(cfg Config) *Server {
 	// Часы хранилищ те же, что у сервера: иначе тест с подменённым Now
 	// получил бы инциденты с одним временем и метрики с другим.
 	s.incidents.now = cfg.Now
+	if cfg.Schedule != nil {
+		sched := cfg.Schedule
+		s.incidents.SetScheduleLookup(func(trID, target int64) int64 {
+			stops := sched.Stops(trID)
+			for i, st := range stops {
+				if st.ActionID == target {
+					if i == 0 {
+						return 0 // цель первая: соседа нет, не выдумываем
+					}
+					return stops[i-1].ActionID
+				}
+			}
+			return 0
+		})
+	}
 	s.preds.now = cfg.Now
 	s.routes()
 	return s

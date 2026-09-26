@@ -161,16 +161,20 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 type QueueStats struct {
 	// Depth — кадров ждут модели прямо сейчас. Растёт, когда модель не
 	// справляется, и это первый признак, что пора смотреть в её сторону.
-	Depth int
+	Depth int `json:"depth"`
 	// Submitted, Predicted, Dropped, Abandoned — счётчики планировщика за
 	// всё время работы.
-	Submitted, Predicted, Dropped, Abandoned int64
+	Submitted int64 `json:"submitted"`
+	Predicted int64 `json:"predicted"`
+	Dropped   int64 `json:"dropped"`
+	Abandoned int64 `json:"abandoned"`
 	// Batches, BatchedFrames — обращения батчем и кадров в них.
-	Batches, BatchedFrames int64
+	Batches       int64 `json:"batches"`
+	BatchedFrames int64 `json:"batched_frames"`
 	// BatchSize — распределение размеров пачек. Помогает отличить «батчинг
 	// не настроен» от «батчинг настроен, но выродился в пачки по одному
 	// кадру»: счётчики в обоих случаях выглядят правдоподобно.
-	BatchSize latency.Quantiles
+	BatchSize latency.Quantiles `json:"batch_size"`
 }
 
 // fallbackReporter — предиктор, умеющий рассказать о своей деградации.

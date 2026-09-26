@@ -32,12 +32,17 @@ float|bool|null. Состав фич валидируется по списку 
 Формат ответа (§4.5): ``{sample_id, delay_s, p_late, p_ontime, p_early,
 reason, horizon_min, source, model_version}``. ``delay_s`` для delta-режима
 = ``cur_dev_s + дельта`` через общую :func:`predictor.composition.compose_prediction`
-(тот же код, что CLI :mod:`predictor.predict`). ``p_late``/``p_ontime``/
-``p_early`` — заглушка None: классификатор P(late) появится только в v4
-(задача #9, этап 5.1 roadmap), импровизировать вероятности из регрессии
-без обоснования нечем. ``reason`` — None: интерпретацию причины прогноза
-строит Go-шлюз, ML-модуль её не знает. ``source`` — ``model`` либо
-``fallback_cur_dev`` — та самая «явная пометка» из §4.7.
+(тот же код, что CLI :mod:`predictor.predict`). ``p_late`` — вероятность
+порога красной зоны (delay >= 120 с), парный классификатор
+:mod:`predictor.late` (v4), подключаемый ``--late-model`` и сверенный по
+списку фич с регрессией при загрузке; без него ``null`` — честнее нуля,
+из которого пороги риска gateway (0.3/0.6) сделали бы «вечно зелёный» мир.
+``p_ontime``/``p_early`` — ``null``: трёхклассовая голова не реализована,
+импровизировать вероятности из регрессии без обоснования нечем. ``reason``
+— правила §5.4 (:func:`predictor.late.infer_reason`, строки паритетны с
+replay-генератором); у fallback-ответа ``null``: объяснять кадр, который
+даже не дошёл до валидации фич, — обещать больше, чем знаешь. ``source`` —
+``model`` либо ``fallback_cur_dev`` — та самая «явная пометка» из §4.7.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict
 
+from predictor import late as late_head
 from predictor.composition import (
     compose_prediction,
     load_model,
@@ -93,7 +99,12 @@ class PredictRequest(BaseModel):
 
 @dataclass(frozen=True)
 class ModelState:
-    """Иммутабельный снимок загруженной модели (замена — только целиком)."""
+    """Иммутабельный снимок загруженной модели (замена — только целиком).
+
+    ``late_*`` — парный бинарный классификатор P(delay >= 120 с)
+    (:mod:`predictor.late`, v4): свой артефакт, те же фичи в том же порядке
+    (паритет проверен при загрузке), один проход матрицы на обе головы.
+    """
 
     path: str
     model: Any  # CatBoostRegressor
@@ -103,6 +114,10 @@ class ModelState:
     metrics: dict | None
     trained_at: str  # mtime артефакта (в metrics-json даты обучения нет)
     loaded_at: str
+    late_model: Any = None           # CatBoostClassifier | None
+    late_version: str | None = None
+    late_metrics: dict | None = None
+    late_path: str | None = None
 
 
 @dataclass
@@ -124,11 +139,15 @@ def _iso(ts: float) -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))
 
 
-def load_state(model_path: str | Path) -> ModelState:
+def load_state(model_path: str | Path,
+               late_path: str | Path | None = None) -> ModelState:
     """Загрузить артефакт + метрики; любая ошибка — исключение (не fallback).
 
     Fallback решает вызывающий (:func:`create_app` на старте ловит и работает
     без модели; /model/reload отвечает 400 и не трогает старую состояние).
+    ``late_path`` — артефакт P(late)-классификатора: ошибка загрузки или
+    расхождение списка фич считаются ошибкой всей пары (атомарно — gateway
+    остаётся на предыдущем снимке, чем на регрессии без головы вероятности).
     """
     model_path = Path(model_path)
     if not model_path.is_file():
@@ -136,6 +155,11 @@ def load_state(model_path: str | Path) -> ModelState:
     model = load_model(model_path)
     metrics = metrics_for_model(model_path)
     features = model_feature_names(model, model_path, metrics)
+    late_model = late_version = late_metrics = None
+    if late_path is not None:
+        late_model, late_metrics = late_head.load_late(late_path)
+        late_head.require_parity(list(late_metrics['features']), features)
+        late_version = Path(late_path).stem.removeprefix('model_')
     return ModelState(
         path=str(model_path),
         model=model,
@@ -145,6 +169,10 @@ def load_state(model_path: str | Path) -> ModelState:
         metrics=metrics,
         trained_at=_iso(model_path.stat().st_mtime),
         loaded_at=_iso(time.time()),
+        late_model=late_model,
+        late_version=late_version,
+        late_metrics=late_metrics,
+        late_path=str(late_path) if late_path is not None else None,
     )
 
 
@@ -210,13 +238,17 @@ def _predict_requests(app_state: AppState, reqs: list[PredictRequest]) -> tuple[
     X = to_matrix(df, state.features).to_numpy().astype(np.float64)
     t0 = time.perf_counter()
     raw = np.asarray(state.model.predict(X), dtype=np.float64)
+    # p_late — та же матрица X: фичи классификатора сверены с регрессией
+    # при загрузке (load_state), поэтому второй проход по кадру не нужен.
+    p_late = (late_head.predict_p_late(state.late_model, X)
+              if state.late_model is not None else None)
     elapsed = time.perf_counter() - t0
     cur = np.array([r.cur_dev_s for r in reqs], dtype=np.float64)
     delay = compose_prediction(raw, cur, state.target_mode, context='/predict')
     delay = np.nan_to_num(delay, nan=0.0)  # NaN-вывод = нулевое смещение (как в predict.py)
 
     answers = []
-    for r, d in zip(reqs, delay, strict=True):
+    for i, (r, d) in enumerate(zip(reqs, delay, strict=True)):
         horizon = r.horizon_s
         if horizon is None:
             h_val = r.feature_values().get('horizon_s')
@@ -224,10 +256,10 @@ def _predict_requests(app_state: AppState, reqs: list[PredictRequest]) -> tuple[
         answers.append({
             'sample_id': r.sample_id,
             'delay_s': float(d),
-            'p_late': None,
-            'p_ontime': None,
+            'p_late': None if p_late is None else float(p_late[i]),
+            'p_ontime': None,   # трёхклассовая голова — не реализована
             'p_early': None,
-            'reason': None,
+            'reason': late_head.infer_reason(rows[i]),
             'horizon_min': (horizon / 60.0) if horizon is not None else None,
             'source': 'model',
             'model_version': state.version,
@@ -251,14 +283,15 @@ class AppState:
     def load_error(self) -> str | None:
         return self._load_error
 
-    def try_load(self, model_path: str | Path, *, count_reload: bool = False,
+    def try_load(self, model_path: str | Path, *, late_path: str | Path | None = None,
+                 count_reload: bool = False,
                  ) -> tuple[ModelState | None, str | None]:
         """(новая модель | None, ошибка). Провал — старое состояние не трогается.
 
         Успех — атомарная замена ссылки под локом (§ hot reload без рестарта).
         """
         try:
-            new = load_state(model_path)
+            new = load_state(model_path, late_path)
         except Exception as exc:  # noqa: BLE001 — любой провал артефакта = деградация
             with self._lock:
                 self.counters.load_failures += 1
@@ -274,7 +307,8 @@ class AppState:
         self._load_error = error
 
 
-def create_app(model_path: str | Path | None = None) -> FastAPI:
+def create_app(model_path: str | Path | None = None,
+               late_model_path: str | Path | None = None) -> FastAPI:
     """Собрать FastAPI-приложение. ``model_path=None`` — сразу fallback-режим.
 
     Сбой загрузки на старте НЕ валит сервис: фиксируем ошибку и отвечаем
@@ -283,7 +317,7 @@ def create_app(model_path: str | Path | None = None) -> FastAPI:
     """
     app_state = AppState()
     if model_path is not None:
-        new, err = app_state.try_load(model_path)
+        new, err = app_state.try_load(model_path, late_path=late_model_path)
         if new is None:
             app_state.set_start_failure(err or 'неизвестная ошибка загрузки')
             print(f'предупреждение: модель не загружена ({err}) — fallback cur_dev_s',
@@ -336,6 +370,7 @@ def create_app(model_path: str | Path | None = None) -> FastAPI:
         }
         if state is None:
             info['version'] = None
+            info['late'] = None
             return info
         m = state.metrics or {}
         internal = m.get('internal_validation') or {}
@@ -354,6 +389,19 @@ def create_app(model_path: str | Path | None = None) -> FastAPI:
             'n_train_rows': m.get('n_train_rows'),
             'n_holdout_rows': m.get('n_holdout_rows'),
         })
+        if state.late_metrics is not None:
+            lm = state.late_metrics
+            info['late'] = {
+                'version': state.late_version,
+                'threshold_s': lm.get('threshold_s'),
+                'auc_holdout': lm.get('auc_holdout'),
+                'accuracy_holdout': lm.get('accuracy_holdout'),
+                'precision_holdout': lm.get('precision_holdout'),
+                'recall_holdout': lm.get('recall_holdout'),
+                'positive_rate_holdout': lm.get('positive_rate_holdout'),
+            }
+        else:
+            info['late'] = None
         return info
 
     @app.post('/model/reload')
@@ -364,7 +412,8 @@ def create_app(model_path: str | Path | None = None) -> FastAPI:
             return JSONResponse({'detail': "нужно тело {\"model\": \"путь к артефакту\"}"},
                                 status_code=400)
         old = app_state.snapshot()
-        new, err = app_state.try_load(path, count_reload=True)
+        new, err = app_state.try_load(path, late_path=old.late_path if old else None,
+                                      count_reload=True)
         if new is None:
             # провал загрузки = 4xx и СТАРАЯ модель остаётся в работе (§4.7)
             return JSONResponse({
@@ -439,6 +488,8 @@ def create_app(model_path: str | Path | None = None) -> FastAPI:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description='ML-сервис predictor.serve (FastAPI, §4.5)')
     ap.add_argument('--model', default=None, help='путь к model_v1*.json (без него — fallback)')
+    ap.add_argument('--late-model', default=None,
+                    help='путь к model_*_late.json: парный P(late)-классификатор (v4)')
     ap.add_argument('--no-model', action='store_true', help='стартить сразу в fallback-режиме')
     ap.add_argument('--host', default='0.0.0.0')
     ap.add_argument('--port', type=int, default=8000)
@@ -447,7 +498,8 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     model = None if (args.no_model or args.model is None) else args.model
-    uvicorn.run(create_app(model), host=args.host, port=args.port, log_level='info')
+    uvicorn.run(create_app(model, args.late_model), host=args.host, port=args.port,
+                log_level='info')
     return 0
 
 

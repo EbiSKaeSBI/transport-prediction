@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react'
 import type { Store } from './store'
 import type { RouteFC } from './geo'
-import { routeColor } from './geo'
-import { RISK_COLORS, vehicleRisk } from './risk'
+import { routeColor, routeGeometries } from './geo'
+import { RISK_COLORS, vehicleRisk, riskSegmentsFC } from './risk'
 
 interface Props {
   store: Store
@@ -45,7 +45,7 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
     resize()
     window.addEventListener('resize', resize)
 
-    const bounds = (() => {
+    let bounds = (() => {
       let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
       const eat = (c: unknown) => {
         if (Array.isArray(c)) {
@@ -61,6 +61,20 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
       return { minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY }
     })()
 
+    // live без плана (serve без --plan): рамка по первым точкам машин,
+    // иначе все точки лепятся в центр холста и карта выглядит пустой
+    const fitByVehicles = () => {
+      if (bounds || routes) return
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+      for (const v of store.vehicles.values()) {
+        minX = Math.min(minX, v.lon); maxX = Math.max(maxX, v.lon)
+        minY = Math.min(minY, v.lat); maxY = Math.max(maxY, v.lat)
+      }
+      if (!Number.isFinite(minX)) return
+      const eps = 0.002
+      bounds = { minX: minX - eps, maxX: maxX + eps, minY: minY - eps, maxY: maxY + eps }
+    }
+
     const project = (lon: number, lat: number): [number, number] => {
       if (!bounds) return [w / 2, h / 2]
       const x = (lon - bounds.minX) / (bounds.maxX - bounds.minX) * w
@@ -69,6 +83,7 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
     }
 
     const draw = () => {
+      fitByVehicles()
       ctx.fillStyle = '#101418'
       ctx.fillRect(0, 0, w, h)
       for (const f of routes?.features ?? []) {
@@ -87,6 +102,17 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
           ctx.fillStyle = '#5d6a75'
           ctx.beginPath(); ctx.arc(x0, y0, 1.3, 0, Math.PI * 2); ctx.fill()
         }
+      }
+      // участки маршрутов с риском ТС — тот же riskSegmentsFC, что в MapView:
+      // фолбэк не должен врать иначе, чем основная карта
+      for (const seg of riskSegmentsFC(routeGeometries(routes), store.vehicles.values(), store.clock).features) {
+        const [a, b] = seg.geometry.coordinates
+        const [x1, y1] = project(a[0], a[1])
+        const [x2, y2] = project(b[0], b[1])
+        ctx.strokeStyle = RISK_COLORS[seg.properties.risk]
+        ctx.globalAlpha = 0.75; ctx.lineWidth = 4; ctx.lineCap = 'round'
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
+        ctx.globalAlpha = 1
       }
       for (const v of store.vehicles.values()) {
         const [x, y] = project(v.lon, v.lat)

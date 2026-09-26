@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Store } from './store'
-import { detectSource } from './source'
+import { apiBase, detectSource } from './source'
 import type { DataSource } from './source'
 import MapView from './MapView'
-import type { RouteFC } from './geo'
-import { paintRoutes } from './geo'
+import type { PlanStop, RouteFC } from './geo'
+import { paintRoutes, routesFromPlan } from './geo'
 import CanvasMap from './CanvasMap'
 import { Clock, IncidentRail, MetricsPanel, ModelPanel, StreamEndedBadge, VehicleCard } from './panels'
 import './App.css'
@@ -38,8 +38,40 @@ export default function App() {
   const [webgl] = useState(hasWebGL)
 
   useEffect(() => {
-    if (live) return // в live карта рисуется из кадров потока, geojson не нужен
     let mounted = true
+    const takeNames = (fc: RouteFC) => {
+      const names = new Map<number, string>()
+      for (const f of fc.features) {
+        if (f.properties.kind === 'stop' && f.properties.name) {
+          names.set(Number(f.properties.stop_id), String(f.properties.name))
+        }
+      }
+      return names
+    }
+    if (live) {
+      // Live: маршруты — план-график самого gateway (GET /api/v1/routes +
+      // /routes/{tr}/stops). Geojson-файла здесь нет и не будет: источник
+      // истины — тот же schedule, по которому считаются прогнозы.
+      const base = apiBase()
+      fetch(`${base}/api/v1/routes`)
+        .then(async r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          const data = await r.json() as { routes?: { tr_id: number }[] }
+          const lists = await Promise.all((data.routes ?? []).map(rt =>
+            fetch(`${base}/api/v1/routes/${rt.tr_id}/stops`)
+              .then(s => (s.ok ? s.json() : { stops: [] }))
+              .then(d => (d.stops ?? []) as PlanStop[])))
+          if (!mounted) return
+          const fc = paintRoutes(routesFromPlan(lists))
+          setStopNames(takeNames(fc))
+          setRoutes(fc)
+        })
+        .catch(() => {
+          // не fatal: машины видны и без плана (fitBy по траекториям в MapView)
+          if (mounted) setError('План-график с gateway не пришёл — карта без маршрутов (serve без --plan?)')
+        })
+      return () => { mounted = false }
+    }
     fetch('/demo/routes.geojson')
       .then(r => {
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
@@ -47,20 +79,14 @@ export default function App() {
       })
       .then(fc => {
         if (!mounted) return
-        const names = new Map<number, string>()
-        for (const f of fc.features) {
-          if (f.properties.kind === 'stop' && f.properties.name) {
-            names.set(Number(f.properties.stop_id), String(f.properties.name))
-          }
-        }
-        setStopNames(names)
+        setStopNames(takeNames(fc))
         setRoutes(paintRoutes(fc))
       })
       .catch(() => {
         if (mounted) setError('Нет demo/routes.geojson — сгенерируйте поток: python3 scripts/make_dashboard_demo.py')
       })
     return () => { mounted = false }
-  }, [])
+  }, [live])
 
   useEffect(() => {
     let mounted = true
@@ -121,7 +147,7 @@ export default function App() {
         <aside>
           <IncidentRail store={store} stopNames={stopNames} live={live} />
           <VehicleCard store={store} trId={selected} />
-          <MetricsPanel store={store} />
+          <MetricsPanel store={store} live={live} />
           <ModelPanel store={store} />
         </aside>
       </main>

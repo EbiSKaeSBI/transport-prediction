@@ -535,6 +535,14 @@ func (c *MLClient) prediction(f horizon.Frame, out predictResponse) (Prediction,
 		}
 		p.PLate = *out.PLate
 	}
+	// Причина едет текстом от сервиса; обрезаем по руне, а не по байту:
+	// строки русские, и обрезка посреди UTF-8 превратила бы объяснение в
+	// кракозябры на дашборде.
+	if r := []rune(out.Reason); len(r) > 160 {
+		p.Reason = string(r[:160])
+	} else {
+		p.Reason = out.Reason
+	}
 	return p, nil
 }
 
@@ -653,9 +661,12 @@ type predictResponse struct {
 	// отдаёт уже сумму; сырой дельты в проволке нет.
 	DelayS *float64 `json:"delay_s"`
 	// PLate — вероятность опоздания в [0, 1]. Может прийти null:
-	// классификатор — это v4 (#9), регрессионная модель v1 вероятностей
-	// не знает.
+	// классификатор подключается флагом --late-model (v4, §5.1), без него
+	// сервис честно отвечает null, и risk считается только по секундам.
 	PLate *float64 `json:"p_late"`
+	// Reason — предполагаемая причина прогноза (правила §5.4 на ML-стороне).
+	// Null/пусто допустимы: у fallback-ответа объяснения нет.
+	Reason string `json:"reason"`
 	// ModelVersion — версия модели. Пустая допустима: версия нужна для
 	// разбора инцидентов, но её отсутствие прогнозу не мешает.
 	ModelVersion string `json:"model_version"`
@@ -681,6 +692,58 @@ type batchResponse struct {
 type modelInfo struct {
 	Version      string   `json:"version"`
 	FeatureNames []string `json:"features"`
+}
+
+// ModelInfo — публичный вид ответа GET /model/info для панели дашборда.
+// От внутреннего modelInfo отличается набором: тому нужны имена признаков
+// для сверки контракта, а панели — паспорт обучения (версия, дата, метрики
+// качества). Разделение намеренное: сверка имён здесь не выполняется и не
+// должна — паспорт интересен именно когда контракт расходится, и прятать
+// его из-за расхождения значило бы оставить панель слепой в тот момент,
+// когда на неё смотрят.
+type ModelInfo struct {
+	Version      string             `json:"version"`
+	Target       string             `json:"target,omitempty"`
+	TrainedAt    string             `json:"trained_at,omitempty"`
+	MAE          map[string]float64 `json:"mae,omitempty"`
+	FeatureCount int                `json:"feature_count"`
+	// Late — паспорт парного P(late)-классификатора (v4); nil, когда голова
+	// не подключена: «нет модели вероятностей» и «вероятность нулевая» —
+	// разные вещи, и панель обязана различать их так же, как проволка.
+	Late *LateInfo `json:"late,omitempty"`
+}
+
+// LateInfo — то из паспорта классификатора, что смотрит диспетчер.
+type LateInfo struct {
+	Version      string   `json:"version"`
+	ThresholdS   float64  `json:"threshold_s"`
+	AUC          *float64 `json:"auc_holdout"`
+	PositiveRate *float64 `json:"positive_rate_holdout"`
+}
+
+// ModelInfo сходит в сервис за паспортом модели. В отличие от fetchInfo
+// имена не проверяет (см. ModelInfo) и не кэширует результат: это редкий
+// запрос панели, а не горячий путь, и кэш показал бы версию, пережившую
+// /model/reload.
+func (c *MLClient) ModelInfo(ctx context.Context) (ModelInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url("/model/info"), nil)
+	if err != nil {
+		return ModelInfo{}, fmt.Errorf("ml: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ModelInfo{}, fmt.Errorf("ml: %w", err)
+	}
+	defer drain(resp)
+	if resp.StatusCode != http.StatusOK {
+		return ModelInfo{}, &statusError{code: resp.StatusCode, body: snippet(resp.Body)}
+	}
+	var info ModelInfo
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(&info); err != nil {
+		return ModelInfo{}, fmt.Errorf("ml: не разобрать /model/info: %w", err)
+	}
+	return info, nil
 }
 
 // fetchInfo сходит в сервис за объявлением модели. Проверка контракта из неё

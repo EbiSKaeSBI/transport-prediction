@@ -84,6 +84,10 @@ type Incident struct {
 	TRID int64 `json:"tr_id"`
 	// TargetStopID — остановка, к которой машина опоздает.
 	TargetStopID int64 `json:"target_stop_id"`
+	// PrevStopID — плановая остановка перед целью: пара с target задаёт
+	// участок маршрута, на котором копится опоздание. 0 — цель первая в
+	// плане либо расписание гейтвею неизвестно (не выдумываем сосед).
+	PrevStopID int64 `json:"prev_stop_id,omitempty"`
 	// Status — состояние.
 	Status IncidentStatus `json:"status"`
 	// Risk — уровень на момент последнего обновления.
@@ -101,6 +105,9 @@ type Incident struct {
 	// PredictedDevS, PLate — значения, давшие красную зону.
 	PredictedDevS float64 `json:"predicted_dev_s"`
 	PLate         float64 `json:"p_late"`
+	// Reason — предполагаемая причина (правила §5.4 на ML-стороне). Пустая,
+	// если прогноз пришёл из baseline/fallback: объяснять нечем.
+	Reason string `json:"reason,omitempty"`
 	// Stale — прогноз, на котором стоит инцидент, устарел.
 	Stale bool `json:"stale"`
 	// Source — откуда взят прогноз, положивший инцидент.
@@ -138,6 +145,10 @@ type Incidents struct {
 	mu   sync.Mutex
 	seq  uint64
 	acks uint64
+	// prevStop — плановая остановка перед целью (участок, на котором копится
+	// опоздание). Инжектируется гейтвеем после New: без расписания поля
+	// просто нет (0), хранилище не обязано его знать.
+	prevStop func(trID, target int64) int64
 }
 
 // NewIncidents создаёт хранилище. Неположительный вместимость берёт
@@ -152,6 +163,24 @@ func NewIncidents(capacity int) *Incidents {
 		cap:   capacity,
 		now:   time.Now,
 	}
+}
+
+// SetScheduleLookup подключает планового соседа цели: инциденты получают
+// prev_stop_id (участок «откуда опаздывают»). Вызывается гейтвеем один раз
+// после New; без него карточка честно живёт без участка.
+func (s *Incidents) SetScheduleLookup(fn func(trID, target int64) int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prevStop = fn
+}
+
+// prevStopOf — плановая остановка перед целью прогноза; 0, когда соседа
+// взять неоткуда (нет расписания или цель первая).
+func (s *Incidents) prevStopOf(p predictor.Prediction) int64 {
+	if s.prevStop == nil {
+		return 0
+	}
+	return s.prevStop(p.TRID, p.TargetStopID)
 }
 
 // IncidentID выводит устойчивый идентификатор из машины и цели. Хэш, а не
@@ -208,6 +237,13 @@ func (s *Incidents) Update(p predictor.Prediction) IncidentEvent {
 		// карточке осталась бы та оценка, на которой инцидент открылся.
 		inc.PredictedDevS = p.PredictedDevS
 		inc.PLate = p.PLate
+		// Причина перезаписывается только когда её принесли: пустая строка
+		// от fallback не должна стирать последнее известное объяснение —
+		// инцидент в этот момент всё ещё красные секунды, и оператору
+		// полезнее старая версия «почему», чем пустое поле.
+		if p.Reason != "" {
+			inc.Reason = p.Reason
+		}
 		inc.Stale = p.Stale
 		inc.Source = p.Source
 		inc.Risk = risk
@@ -236,12 +272,14 @@ func (s *Incidents) Update(p predictor.Prediction) IncidentEvent {
 		UnitID:        p.UnitID,
 		TRID:          p.TRID,
 		TargetStopID:  p.TargetStopID,
+		PrevStopID:    s.prevStopOf(p),
 		Status:        StatusOpen,
 		Risk:          risk,
 		OpenedAt:      now,
 		UpdatedAt:     now,
 		PredictedDevS: p.PredictedDevS,
 		PLate:         p.PLate,
+		Reason:        p.Reason,
 		Stale:         p.Stale,
 		Source:        p.Source,
 	}

@@ -1,4 +1,4 @@
-import type { StreamEvent } from './types'
+import type { ModelEvent, StreamEvent } from './types'
 import { Store } from './store'
 import { WireAdapter } from './wire'
 
@@ -165,6 +165,7 @@ export class WsSource implements DataSource {
     ws.onopen = () => {
       this.retry = 0
       this.status('open')
+      this.fetchPassport()
     }
     ws.onmessage = (msg) => {
       const { events, acked } = this.wire.decodeMessage(String(msg.data))
@@ -182,6 +183,54 @@ export class WsSource implements DataSource {
       this.status('retry', `через ${delay} мс (попытка ${this.retry + 1}, код ${ev?.code ?? '?'})`)
       this.timer = setTimeout(() => { this.timer = null; this.open() }, delay)
     }
+  }
+
+  /**
+   * Паспорт модели для панели «Модель»: version/trained_at/mae из
+   * GET /api/v1/model (прокси ml-core, этап 5). Лента даёт только версию из
+   * source прогноза; остальное лежит в /model/info сервиса, адрес которого
+   * знает гейтвей. Запрос раз на открытие: после реконнекта модель могли
+   * перезагрузить (/model/reload), и панель обязана увидеть новую.
+   * Ошибка безмолвна: отсутствие паспорта — это «—» в панели, а не поломка
+   * потока; живой источник истины для карты и карточек остаётся WS.
+   */
+  private fetchPassport(): void {
+    fetch(`${apiBase()}/api/v1/model`)
+      .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d: {
+        version?: string; target?: string; trained_at?: string
+        feature_count?: number; mae?: Record<string, number>
+        late?: {
+          version?: string; threshold_s?: number
+          auc_holdout?: number | null; positive_rate_holdout?: number | null
+        } | null
+      }) => {
+        if (!d || typeof d.version !== 'string' || !d.version) return
+        const mae = d.mae ?? {}
+        const holdout = typeof mae.mae_holdout_model === 'number' ? mae.mae_holdout_model : null
+        const event: ModelEvent = {
+          type: 'model',
+          ts: Date.now() / 1000,
+          version: `модель ${d.version}`,
+          model_version: d.version,
+          trained_at: typeof d.trained_at === 'string' ? d.trained_at : null,
+          // MAE validate от оракула считается scripts/oracle_audit.py вне
+          // рантайма и на wire физически не приходит — не выдумываем.
+          mae_validate_s: null,
+          mae_test_s: holdout,
+          note: `ML-сервис: ${d.target ?? 'таргет не объявлен'} • `
+            + `${d.feature_count ?? '?'} признаков; MAE validate — только oracle_audit.py`,
+          late: d.late && typeof d.late.version === 'string' ? {
+            version: d.late.version,
+            threshold_s: d.late.threshold_s ?? 120,
+            auc_holdout: typeof d.late.auc_holdout === 'number' ? d.late.auc_holdout : null,
+            positive_rate_holdout:
+              typeof d.late.positive_rate_holdout === 'number' ? d.late.positive_rate_holdout : null,
+          } : null,
+        }
+        this.store.apply(event)
+      })
+      .catch(() => {})
   }
 }
 
@@ -209,4 +258,22 @@ export async function detectSource(store: Store): Promise<DataSource> {
   }
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return new WsSource(store, `${proto}//${window.location.host}/ws/stream`)
+}
+
+/**
+ * Базовый URL REST-эндпоинтов gateway (план-график для карты). По умолчанию
+ * — тот же источник, что и страница: в dev vite проксирует /api на :8080,
+ * в проде фронт отдаёт сам gateway. Явный ?ws=… уводит REST на хост ленты,
+ * иначе дашборд с файла спросит план у localhost и не найдёт.
+ */
+export function apiBase(): string {
+  const ws = new URLSearchParams(window.location.search).get('ws')
+  if (!ws) return ''
+  try {
+    const u = new URL(ws, window.location.href)
+    const http = u.protocol === 'wss:' ? 'https:' : 'http:'
+    return `${http}//${u.host}`
+  } catch {
+    return ''
+  }
 }

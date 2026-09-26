@@ -3,9 +3,9 @@ import { Map as MLMap, NavigationControl } from 'maplibre-gl'
 import type { GeoJSONSource, ExpressionSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import type { Store } from './store'
-import type { RouteFC } from './geo'
-import { routesBounds } from './geo'
-import { RISK_COLORS, vehicleRisk } from './risk'
+import type { RouteFC, RouteGeom } from './geo'
+import { routesBounds, routeGeometries } from './geo'
+import { RISK_COLORS, vehicleRisk, riskSegmentsFC } from './risk'
 import type { VehicleState } from './types'
 
 function vehiclesFC(vehicles: Iterable<VehicleState>, clock: number, selected: number | null) {
@@ -61,16 +61,26 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
     })
     map.addControl(new NavigationControl({ showCompass: false }), 'top-left')
 
+    let geoms: RouteGeom[] = []
+
     map.on('load', () => {
+      geoms = routeGeometries(routes)
       map.addSource('routes', {
         type: 'geojson',
         data: (routes ?? { type: 'FeatureCollection', features: [] }) as never,
       })
       map.addSource('vehicles', { type: 'geojson', data: vehiclesFC([], 0, null) as never })
+      map.addSource('risk-segs', { type: 'geojson', data: riskSegmentsFC(geoms, [], 0) as never })
       map.addLayer({
         id: 'routes-line', type: 'line', source: 'routes',
         filter: ['==', ['get', 'kind'], 'route'],
         paint: { 'line-color': ['get', 'color'] as never, 'line-width': 2, 'line-opacity': 0.8 },
+      } as never)
+      // участки риска поверх линий плана, под точками остановок: диспетчеру
+      // важно, какой участок маршрута горит, а не только где машина
+      map.addLayer({
+        id: 'risk-seg-line', type: 'line', source: 'risk-segs',
+        paint: { 'line-color': riskColorExpr as never, 'line-width': 5, 'line-opacity': 0.75, 'line-cap': 'round' },
       } as never)
       map.addLayer({
         id: 'stops-dot', type: 'circle', source: 'routes',
@@ -94,7 +104,24 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       })
       const bounds = routesBounds(routes)
       if (bounds) map.fitBounds(bounds, { padding: 40 })
+      else fitVehiclesOnce() // live без плана: рамка по первым точкам, иначе карта останется в (0, 0)
     })
+
+    // Подгонка рамки по точкам машин, когда маршрутов нет (serve без --plan).
+    // Один раз при первых валидных координатах — дальше оператор сам рулит зумом.
+    let vehicleFit = routes != null
+    const fitVehiclesOnce = () => {
+      if (vehicleFit) return
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+      for (const v of store.vehicles.values()) {
+        minX = Math.min(minX, v.lon); maxX = Math.max(maxX, v.lon)
+        minY = Math.min(minY, v.lat); maxY = Math.max(maxY, v.lat)
+      }
+      if (!Number.isFinite(minX)) return
+      vehicleFit = true
+      const eps = 0.002
+      map.fitBounds([[minX - eps, minY - eps], [maxX + eps, maxY + eps]], { padding: 40, maxZoom: 14 })
+    }
 
     map.on('click', 'vehicles-dot', (e) => {
       const f = e.features?.[0]
@@ -117,6 +144,9 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
         raf = 0
         const src = map.getSource('vehicles') as GeoJSONSource | undefined
         src?.setData(vehiclesFC(store.vehicles.values(), store.clock, selectedRef.current) as never)
+        const segs = map.getSource('risk-segs') as GeoJSONSource | undefined
+        segs?.setData(riskSegmentsFC(geoms, store.vehicles.values(), store.clock) as never)
+        fitVehiclesOnce() // точки могли приехать позже, чем load отработал
       })
     }
     redrawRef.current = redraw

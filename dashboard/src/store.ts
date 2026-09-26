@@ -66,7 +66,23 @@ export class Store {
         }
         break
       }
-      case 'model': { this.model = ev as ModelEvent; break }
+      case 'model': {
+        // model приходит из двух мест: адаптер ленты (только версия и
+        // источник прогноза) и REST-паспорт ml-core (дата, MAE). Слияние без
+        // затирания известных полей нулём: иначе каждое изменение версии на
+        // ленте возвращало бы панель к «—», и паспорт терялся бы вживую.
+        const m = ev as ModelEvent
+        const prev = this.model
+        if (!prev) this.model = m
+        else {
+          const merged: ModelEvent = { ...prev }
+          for (const [k, v] of Object.entries(m)) {
+            if (v != null && v !== '') (merged as never as Record<string, unknown>)[k] = v
+          }
+          this.model = merged
+        }
+        break
+      }
       case 'meta': { this.meta = ev as MetaEvent; break }
     }
     if (ev.ts > this.clock) this.clock = ev.ts

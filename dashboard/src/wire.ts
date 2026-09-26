@@ -76,6 +76,8 @@ interface WireIncident {
   acked_at?: string | null
   predicted_dev_s?: number
   p_late?: number
+  reason?: string | null
+  prev_stop_id?: number
   stale?: boolean
   source?: string
 }
@@ -292,7 +294,13 @@ export class WireAdapter {
       // предсказанное отставание — то, на чём стоит инцидент; cur_dev_s в
       // контрактном смысле (подсказка точек) в онлайне отсутствует
       cur_dev_s: delay,
-      reason: `риск ${inc.risk ?? '?'}, прогноз ${Math.round(delay)} с, p_late ${pLate.toFixed(2)}`,
+      // причину отдаёт ML-контур (правила §5.4, идут через gateway); её нет
+      // у fallback-прогнозов — тогда подставляем техническую строку, чтобы
+      // карточка не выглядела пустой, и вероятность видна была хотя бы в тексте
+      reason: inc.reason ? String(inc.reason)
+        : `риск ${inc.risk ?? '?'}, прогноз ${Math.round(delay)} с, p_late ${pLate.toFixed(2)}`,
+      p_late: pLate,
+      prev_stop_id: typeof inc.prev_stop_id === 'number' && inc.prev_stop_id > 0 ? inc.prev_stop_id : undefined,
       source: `gateway:${inc.source ?? '?'}`,
     }
     out.events.push(event)

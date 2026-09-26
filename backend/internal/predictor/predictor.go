@@ -73,6 +73,10 @@ type Prediction struct {
 	PredictedDevS float64
 	// PLate — вероятность опоздания в [0, 1].
 	PLate float64
+	// Reason — предполагаемая причина прогноза (правила §5.4 на стороне ML,
+	// predictor.late.infer_reason). Пустая у baseline и fallback: объяснить
+	// кадр правилом «cur_dev» нечего.
+	Reason string
 	// ModelVersion — версия модели, давшая ответ. Пустая у baseline.
 	ModelVersion string
 	// Source — откуда ответ.

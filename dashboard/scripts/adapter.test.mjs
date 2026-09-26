@@ -39,6 +39,7 @@ function inc(over = {}) {
     id: 'inc-1', unit_id: 1166336, tr_id: 122658, target_stop_id: 536,
     status: 'open', risk: 'red', opened_at: AT, updated_at: AT_SAW,
     acked_at: null, predicted_dev_s: 132, p_late: 0.66, stale: false,
+    prev_stop_id: 535,
     source: 'ml', ...over,
   }
 }
@@ -117,7 +118,23 @@ test('incident: карточка инцидента → контрактное �
   assert.equal(i.horizon_s, 720)
   assert.equal(i.predicted_delay_s, 132)
   assert.equal(i.source, 'gateway:ml')
+  assert.equal(i.prev_stop_id, 535) // участок «откуда опаздывают» для карточки
   assert.match(i.reason, /p_late 0\.66/)
+})
+
+test('incident: причина с gateway-провода важнее технической строки, p_late — полем', () => {
+  const a = new WireAdapter()
+  const { events } = a.decodeMessage(wire('incident', {
+    incident: inc({ reason: 'длительный простой на остановке' }), stats: {},
+  }))
+  const i = events[0]
+  assert.equal(i.reason, 'длительный простой на остановке')
+  assert.equal(i.p_late, 0.66)
+  // null от fallback-прогноза — возвращаемся к технической строке
+  const { events: e2 } = a.decodeMessage(wire('incident', {
+    incident: inc({ reason: null }), stats: {},
+  }))
+  assert.match(e2[0].reason, /p_late 0\.66/)
 })
 
 test('incident: acked помечается на подтверждение, resolved уходит из выдачи без события', () => {

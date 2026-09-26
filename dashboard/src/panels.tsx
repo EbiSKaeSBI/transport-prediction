@@ -1,8 +1,9 @@
 import { useSyncExternalStore } from 'react'
 import * as echarts from 'echarts'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { Store } from './store'
 import type { FrameEvent } from './types'
+import { apiBase } from './source'
 import { formatClock } from './time'
 
 function useStoreRev(store: Store): number {
@@ -37,9 +38,15 @@ export function IncidentRail({ store, stopNames, live }: {
               <b>+{Math.round(i.predicted_delay_s)} с</b>
               <span className="muted">опоздание · ТС {i.tr_id}</span>
             </div>
-            <div className="row2">{stopNames.get(i.target_stop_id) ?? `остановка ${i.target_stop_id}`}</div>
+            <div className="row2">
+              {i.prev_stop_id != null && (
+                <>{stopNames.get(i.prev_stop_id) ?? `остановка ${i.prev_stop_id}`}{' → '}</>
+              )}
+              {stopNames.get(i.target_stop_id) ?? `остановка ${i.target_stop_id}`}
+            </div>
             <div className="row3 muted">
-              {formatClock(i.ts)} · горизонт {(i.horizon_s / 60).toFixed(1)} мин · {i.reason}
+              {formatClock(i.ts)} · горизонт {(i.horizon_s / 60).toFixed(1)} мин
+              {i.p_late != null && ` · P(опозд.) ${(i.p_late * 100).toFixed(0)}%`} · {i.reason}
             </div>
             <div className="row3 muted">модель: {i.source}</div>
             {!i.acked && (
@@ -105,15 +112,58 @@ export function VehicleCard({ store, trId }: { store: Store; trId: number | null
   )
 }
 
-export function MetricsPanel({ store }: { store: Store }) {
+/** Снимок GET /api/v1/metrics/latency (контракт зафиксирован Go-тестом
+ *  dashboard_api_test.go; пустые окна в ответе отсутствуют, а не нулевые). */
+interface Quantiles {
+  count: number; total: number
+  p50_s: number; p95_s: number; p99_s: number; max_s: number
+}
+interface LatencySnapshot {
+  uptime_s: number
+  prediction_latency?: Quantiles
+  inference_latency?: Quantiles
+  queue?: {
+    depth: number; submitted: number; predicted: number; dropped: number
+    batches: number; batched_frames: number
+    batch_size?: Quantiles
+  }
+  throughput?: { predictions_total: number; predictions_per_s: number; inference_per_s: number }
+  stream?: { clients: number; sent_total: number; dropped_total: number }
+  vehicles_known?: number
+}
+
+/** Квантили в миллисекундах: доли секунды в секундах на панели читаются
+ *  как нули, а «23 мс» и «410 мс» различаются глазом сразу. */
+function fmtQ(q: Quantiles | undefined): string {
+  if (!q || q.total === 0) return '—'
+  const ms = (v: number) => Math.round(v * 1000)
+  return `${ms(q.p50_s)} / ${ms(q.p95_s)} / ${ms(q.p99_s)} мс`
+}
+
+export function MetricsPanel({ store, live }: { store: Store; live: boolean }) {
   useStoreRev(store)
   const holder = useRef<HTMLDivElement | null>(null)
   const chart = useRef<echarts.ECharts | null>(null)
+  const [snap, setSnap] = useState<LatencySnapshot | null>(null)
   useEffect(() => {
     if (!holder.current) return
     chart.current = echarts.init(holder.current)
     return () => { chart.current?.dispose(); chart.current = null }
   }, [])
+  // Опрос раз в 5 с — не polling основной ленты (позиции и инциденты идут
+  // по WS), а снимок агрегатов: latency-окно гейтвея обновляется само по
+  // тикам, и дергать его чаще смысла нет.
+  useEffect(() => {
+    if (!live) return
+    let mounted = true
+    const load = () => fetch(`${apiBase()}/api/v1/metrics/latency`)
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => { if (mounted && d) setSnap(d as LatencySnapshot) })
+      .catch(() => { /* gateway ещё не поднялся или baseline — панель остаётся честной */ })
+    load()
+    const timer = setInterval(load, 5000)
+    return () => { mounted = false; clearInterval(timer) }
+  }, [live])
   useEffect(() => {
     const buckets = store.rate
     chart.current?.setOption({
@@ -134,7 +184,26 @@ export function MetricsPanel({ store }: { store: Store }) {
         <div><b>{store.openIncidents()}</b><span>откр. инцидентов</span></div>
       </div>
       <div ref={holder} className="chart" />
-      <p className="muted tiny">p50/p95/p99 инференса появятся вместе с ML-сервисом (этап 3) — сейчас прогноз считает правило-фолбэк.</p>
+      {live ? (
+        <table className="kv">
+          <tbody>
+            <tr><td>инференция p50/p95/p99</td><td>{fmtQ(snap?.inference_latency)}</td></tr>
+            <tr><td>прогноз целиком p50/p95/p99</td><td>{fmtQ(snap?.prediction_latency)}</td></tr>
+            <tr><td>очередь · сброшено</td>
+              <td>{snap?.queue ? `${snap.queue.depth} / ${snap.queue.dropped}` : '—'}</td></tr>
+            <tr><td>прогнозов в секунду</td>
+              <td>{snap?.throughput ? snap.throughput.predictions_per_s.toFixed(3) : '—'}</td></tr>
+            <tr><td>лента · подписчиков</td>
+              <td>{snap?.stream ? `${snap.stream.sent_total} / ${snap.stream.clients}` : '—'}</td></tr>
+          </tbody>
+        </table>
+      ) : (
+        <p className="muted tiny">
+          В replay прогноз считает правило-фолбэк; p50/p95/p99 инференции,
+          очередь и пропускная способность — в live-режиме
+          (GET /api/v1/metrics/latency).
+        </p>
+      )}
     </section>
   )
 }
@@ -142,6 +211,15 @@ export function MetricsPanel({ store }: { store: Store }) {
 export function ModelPanel({ store }: { store: Store }) {
   useStoreRev(store)
   const m = store.model
+  // Числа из паспорта — сырые float из CatBoost; диспетчеру хватит десятих
+  // секунды, а «68.27979460888994» читается как баг.
+  const mae = (v: number | null | undefined) => (v != null ? `${v.toFixed(1)} с` : '—')
+  const date = (iso: string | null | undefined) => {
+    if (!iso) return '—'
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? iso
+      : d.toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' })
+  }
   return (
     <section className="panel">
       <h2>Модель</h2>
@@ -149,9 +227,15 @@ export function ModelPanel({ store }: { store: Store }) {
         <table className="kv">
           <tbody>
             <tr><td>версия</td><td>{m.version}</td></tr>
-            <tr><td>MAE validate (оракул)</td><td>{m.mae_validate_s != null ? `${m.mae_validate_s} с` : '—'}</td></tr>
-            <tr><td>MAE test</td><td>{m.mae_test_s != null ? `${m.mae_test_s} с` : '—'}</td></tr>
-            <tr><td>обучена</td><td>{m.trained_at ?? '—'}</td></tr>
+            <tr><td>MAE validate (оракул)</td><td>{mae(m.mae_validate_s)}</td></tr>
+            <tr><td>MAE test</td><td>{mae(m.mae_test_s)}</td></tr>
+            <tr>
+              <td>P(опозд.)</td>
+              <td>{m.late
+                ? `${m.late.version}: AUC ${m.late.auc_holdout?.toFixed(3) ?? '—'} (порог ${m.late.threshold_s} с)`
+                : 'голова не подключена'}</td>
+            </tr>
+            <tr><td>обучена</td><td>{date(m.trained_at)}</td></tr>
           </tbody>
         </table>
       ) : <p className="muted">Событие model ещё не приходило.</p>}

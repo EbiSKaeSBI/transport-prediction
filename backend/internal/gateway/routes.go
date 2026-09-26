@@ -53,6 +53,9 @@ func (s *Server) routeTable() []route {
 
 		{"GET /api/v1/predictions/{sample_id}", s.prediction, true},
 		{"POST /api/v1/predict", s.predict, true},
+
+		{"GET /api/v1/metrics/latency", s.metricsLatency, true},
+		{"GET /api/v1/model", s.modelMeta, true},
 	}
 }
 

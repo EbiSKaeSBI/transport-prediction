@@ -349,6 +349,7 @@ GET  /api/v1/predictions/{sample_id}      прогноз + горизонт + п
 POST /api/v1/predict                      пробный запрос (проверка Swagger)
 POST /api/v1/whatif                       выпуск доп. ТС → влияние на график
 GET  /api/v1/metrics/latency              p50/p95/p99, throughput, глубина очереди
+GET  /api/v1/model                        прокси /model/info ml-core (панель «Модель»)
 WS   /ws/stream                           позиции, риск, инциденты, метрики
 ```
 
@@ -357,10 +358,10 @@ WS   /ws/stream                           позиции, риск, инциде
 ```
 POST /predict         feature vector → {delay_s, p_late, p_ontime, p_early, reason, horizon_min}
 POST /predict/batch   {frames: [predict-кадр, …]}
-                      → {predictions: [{sample_id, delta_s, p_late, model_version}, …]}
+                      → {predictions: [{sample_id, …тот же predict-ответ}, …]}
                       порядок ответов не задан: клиент сопоставляет их по
                       sample_id, см. ADR 0009
-GET  /model/info      версия, фичи, метрики обучения, дата
+GET  /model/info      версия, фичи, метрики обучения, дата, паспорт P(late)-головы
 POST /model/reload    горячая перезагрузка модели без рестарта
 GET  /healthz  /metrics
 ```

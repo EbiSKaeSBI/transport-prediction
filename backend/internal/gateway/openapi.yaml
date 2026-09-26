@@ -517,6 +517,102 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Incident" }
 
+  /api/v1/metrics/latency:
+    get:
+      tags: [Прогнозы]
+      summary: Латентность, очередь и пропускная способность в JSON
+      description: |
+        Те же числа, что отдаёт `/metrics`, но в формате, который читает
+        дашборд: разбирать текстовый exposition в браузере означало бы
+        удвоить формат без единого теста, сверяющего половины.
+
+        Пустые окна из ответа выкидываются, а не заполняются нулями: ноль в
+        `p50_s` читается как «быстро», тогда как правда — «ещё ни одного
+        замера». `prediction_latency` считает весь путь кадра, `inference_latency`
+        — только обращение к модели; разница между ними и есть ответ на вопрос
+        «мы медленные или модель».
+      responses:
+        "200":
+          description: Снимок метрик
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [uptime_s]
+                properties:
+                  uptime_s: { type: number, format: double, example: 640.2 }
+                  prediction_latency: { $ref: "#/components/schemas/Quantiles" }
+                  inference_latency: { $ref: "#/components/schemas/Quantiles" }
+                  queue:
+                    type: object
+                    description: Снимок очереди планировщика
+                    properties:
+                      depth: { type: integer, example: 0 }
+                      submitted: { type: integer, format: int64 }
+                      predicted: { type: integer, format: int64 }
+                      dropped: { type: integer, format: int64 }
+                  throughput:
+                    type: object
+                    properties:
+                      predictions_total: { type: integer, format: int64 }
+                      predictions_per_s: { type: number, format: double, example: 0.02 }
+                      inference_per_s: { type: number, format: double, example: 0.02 }
+                  stream:
+                    type: object
+                    properties:
+                      clients: { type: integer, example: 1 }
+                      sent_total: { type: integer, format: int64 }
+                  vehicles_known: { type: integer, example: 30 }
+
+  /api/v1/model:
+    get:
+      tags: [Прогнозы]
+      summary: Паспорт модели
+      description: |
+        Ответ сервиса модели `GET /model/info` через прокси гейтвея. Прокси, а
+        не прямой запрос панели: адрес ml-core знает только гейтвей, и один
+        вход для всей панели сохраняет правило «дашборд общается с гейтвеем».
+        Не кэшируется — `/model/reload` меняет версию на лету.
+      responses:
+        "200":
+          description: Паспорт загруженной модели
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, feature_count]
+                properties:
+                  version: { type: string, example: v1online }
+                  target: { type: string, example: delay_delta_s }
+                  trained_at: { type: string, example: "2026-09-26T13:06:23Z" }
+                  feature_count: { type: integer, example: 19 }
+                  late:
+                    type: object
+                    nullable: true
+                    description: >-
+                      Паспорт парного P(late)-классификатора (v4); null, если
+                      голова не подключена — «нет вероятностной модели» и
+                      «вероятность нулевая» обязан различать и прокси
+                    properties:
+                      version: { type: string, example: v1online_late }
+                      threshold_s: { type: number, example: 120 }
+                      auc_holdout: { type: number, nullable: true, format: double }
+                      positive_rate_holdout: { type: number, nullable: true, format: double }
+                  mae:
+                    type: object
+                    description: Метрики обучения, имена — как у сервиса модели
+                    additionalProperties: { type: number, format: double }
+        "502":
+          description: Сервис модели не ответил
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Модель не подключена (baseline-режим)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
 components:
   parameters:
     UnitId:
@@ -620,6 +716,22 @@ components:
         stored: { type: integer, description: Сколько прогнозов в хранилище }
         total: { type: integer, description: Сколько прошло за всё время }
 
+    Quantiles:
+      type: object
+      description: |
+        Сводка по окну замеров. `count` — сколько значений в окне сейчас,
+        `total` — сколько прошло за всё время жизни окна; при переполнении
+        окна первое больше второго не бывает, второе не меньше первого.
+      required: [count, total, p50_s, p95_s, p99_s, max_s]
+      properties:
+        count: { type: integer }
+        total: { type: integer, format: int64 }
+        p50_s: { type: number, format: double }
+        p95_s: { type: number, format: double }
+        p99_s: { type: number, format: double }
+        max_s: { type: number, format: double }
+        broken: { type: boolean, description: Встретился ли замер, который нельзя учесть }
+
     Readiness:
       type: object
       required: [ready, uptime_s, checks, incidents, predictions]
@@ -688,6 +800,11 @@ components:
           minimum: 0
           maximum: 1
           description: Вероятность опоздания
+        reason:
+          type: string
+          description: >-
+            Предполагаемая причина прогноза (правила §5.4, поле 7 proto/ml.proto);
+            отсутствует у baseline и fallback
         source: { $ref: "#/components/schemas/Source" }
         stale:
           type: boolean
@@ -930,6 +1047,17 @@ components:
           format: double
           description: Значение, давшее красную зону
         p_late: { type: number, format: double, minimum: 0, maximum: 1 }
+        prev_stop_id:
+          type: integer
+          format: int64
+          description: >-
+            Плановая остановка перед целью (участок «откуда опаздывают»);
+            отсутствует, когда цель первая или расписание неизвестно
+        reason:
+          type: string
+          description: >-
+            Последняя принесённая причина прогноза (пустая, если объяснения
+            не было ни у одного обновления инцидента)
         stale:
           type: boolean
           description: Прогноз, на котором стоит инцидент, устарел

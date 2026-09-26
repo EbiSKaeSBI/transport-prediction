@@ -44,6 +44,10 @@ export interface IncidentEvent {
   predicted_delay_s: number
   cur_dev_s: number
   reason: string
+  /** Вероятность опоздания из карточки gateway (решето риска на карте). */
+  p_late?: number
+  /** Плановая остановка перед целью — участок, на котором копится опоздание. */
+  prev_stop_id?: number
   source: string
 }
 
@@ -57,6 +61,15 @@ export interface ModelEvent {
   mae_test_s: number | null
   note?: string
   features?: string[]
+  /** Паспорт P(late)-классификатора (v4); null — голова не подключена. */
+  late?: LatePassport | null
+}
+
+export interface LatePassport {
+  version: string
+  threshold_s: number
+  auc_holdout: number | null
+  positive_rate_holdout: number | null
 }
 
 export interface MetaEvent {

@@ -235,9 +235,12 @@ func TestSpecHasNoExternalReferences(t *testing.T) {
 // принималось осознанно, а не случайно добавилось вместе с новым
 // обработчиком.
 func TestEndpointCount(t *testing.T) {
+	// 18 с этапа 5: добавлены GET /api/v1/metrics/latency и GET /api/v1/model —
+	// панель производительности и панель модели (§6) читают JSON, а не текст
+	// Prometheus, и адрес ml-core остаётся скрыт за гейтвеем.
 	n := len(testServer(t).routeTable())
-	if n != 16 {
-		t.Errorf("маршрутов %d, ожидалось 16", n)
+	if n != 18 {
+		t.Errorf("маршрутов %d, ожидалось 18", n)
 	}
 	if got := len(specFromYAML(t)); got != n {
 		t.Errorf("в спецификации %d эндпоинтов, а в коде %d", got, n)
