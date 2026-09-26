@@ -180,9 +180,15 @@ def load_frames() -> list[dict]:
 
 
 def incident_reason(values: dict) -> str:
-    dwell = values.get("dwell_current_s", 0.0)
-    speed = values.get("speed_current", 99.0)
-    headway = values.get("headway_s", 999.0)
+    # Не values.get(key, default): Go пишет пропуски явным JSON null,
+    # ключ тогда присутствует, и None ломает сравнения ниже.
+    def num(key: str, default: float) -> float:
+        v = values.get(key)
+        return default if v is None else float(v)
+
+    dwell = num("dwell_current_s", 0.0)
+    speed = num("speed_current", 99.0)
+    headway = num("headway_s", 999.0)
     if dwell >= 60:
         return "длительный простой на остановке"
     if dwell >= 20:
