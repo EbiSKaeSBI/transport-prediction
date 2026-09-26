@@ -69,6 +69,10 @@ func runServe(args []string) error {
 	statsEvery := fs.Duration("stats", 30*time.Second, "как часто печатать сводку (0 — не печатать)")
 	planPath := fs.String("plan", "", "CSV планового графика (обязателен для прогноза)")
 	bindingPath := fs.String("binding", "", "CSV соответствия tr_id и unit_id (обязателен)")
+	planWatchEvery := fs.Duration("plan-watch", time.Second,
+		"как часто перечитывать --plan/--binding после старта (0 — не следить)")
+	captureOut := fs.String("capture-out", "",
+		"каталог записи кадров принимаемого потока (пусто — не писать)")
 	tickEvery := fs.Duration("tick", 15*time.Second, "как часто проверять наступление границы ячейки")
 	gridEvery := fs.Duration("grid", pipeline.DefaultGrid, "шаг сетки моментов прогноза")
 	dryRun := fs.Bool("dry-run", false, "не строить прогноз: только принимать и хранить телеметрию")
@@ -107,6 +111,10 @@ func runServe(args []string) error {
 	observer := telemetry.New(output, telemetry.WithLogger(logger))
 	store := statestore.New()
 
+	// holder заполняется ниже, когда план загружен; nil означает «плана нет»,
+	// и конвейер с гейтвеем тогда только копят телеметрию.
+	var holder *schedule.Holder
+
 	// Без расписания прогнозировать нечего, но принимать телеметрию всё равно
 	// нужно: так сервер можно поднять на площадке до того, как туда доедут
 	// планы. Поэтому отсутствие файлов — не ошибка запуска, а режим
@@ -135,11 +143,15 @@ func runServe(args []string) error {
 		if err != nil {
 			return fmt.Errorf("привязка %s: %w", *bindingPath, err)
 		}
-		cfg.Schedule = plan
-		cfg.Binding = binding
+		// План и привязка едут в holder, а не в копию конфига: файл плана
+		// переписывается на ходу, и конвейер с гейтвеем обязаны увидеть новый
+		// без перезапуска процесса.
+		holder = schedule.NewHolder(plan, binding)
+		cfg.Holder = holder
 		logger.Info("расписание загружено",
 			"план", *planPath, "привязка", *bindingPath,
-			"остановок", plan.StopsCount(), "единиц", binding.Len())
+			"остановок", plan.StopsCount(), "единиц", binding.Len(),
+			"слежение", *planWatchEvery > 0)
 	}
 
 	pred, ml := predictorChain(*mlURL, *mlTimeout, logger)
@@ -168,6 +180,24 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Запись кадров идёт отводом от того же входа, который ест конвейер:
+	// план-график должен строиться ровно по этому потоку, а второй
+	// NDTP-слушатель на :9201 не встал бы — порт уже занят сервером.
+	if *captureOut != "" {
+		rec, closeCapture, err := newCaptureHandler(*captureOut, 0, nil)
+		if err != nil {
+			return fmt.Errorf("запись кадров: %w", err)
+		}
+		// хвост буфера — на диск до закрытия файлов, иначе последние секунды
+		// записи потерялись бы именно тем, ради чего запись нужна
+		defer func() {
+			rec.Flush()
+			closeCapture()
+		}()
+		server.Handler = ndtpserver.NewFanout(pipe, rec)
+		logger.Info("ведётся запись кадров для генерации плана", "каталог", *captureOut)
+	}
+
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("не удалось слушать %s: %w", *listen, err)
@@ -180,6 +210,14 @@ func runServe(args []string) error {
 		go pipe.Run(ctx, *tickEvery)
 		go sched.Run(ctx)
 		go hub.Run(ctx)
+	}
+
+	// Наблюдение за файлом плана включается только когда есть и слежение, и
+	// сам план: в режиме накопления перечитывать нечего.
+	if holder != nil && *planWatchEvery > 0 {
+		watcher := newPlanWatcher(*planPath, *bindingPath, holder, pipe, logger,
+			*planWatchEvery)
+		go watcher.Run(ctx)
 	}
 
 	if *httpAddr != "" && gw != nil {
@@ -267,6 +305,7 @@ func buildService(opts serviceOptions) (*service, error) {
 			Store:     opts.Pipeline.Store,
 			Schedule:  opts.Pipeline.Schedule,
 			Binding:   opts.Pipeline.Binding,
+			Holder:    opts.Pipeline.Holder,
 			Predictor: opts.Predictor,
 			ML:        opts.ML,
 			Hub:       hub,
@@ -380,9 +419,15 @@ func reportStats(ctx context.Context, addr string, observer *telemetry.Observer,
 				"байт", metrics.BytesRead,
 				"кадров", forecast.Frames,
 				"повторов", forecast.Deduped,
-				"без_привязки", forecast.NoBinding,
-				"без_окна", forecast.NoSchedule,
-				"без_данных_на_T", forecast.NoStateAtT,
+			"без_привязки", forecast.NoBinding,
+			"без_окна", forecast.NoSchedule,
+			"без_данных_на_T", forecast.NoStateAtT,
+			// Отказы планировщика — единственная причина, по которой кадры
+			// могут перестать строиться при живых привязке и окне расписания.
+			// Без этого счётчика в сводке такой отказ выглядит как зависший
+			// конвейер: все видимые числа стоят, в логе нет ни ошибки, ни
+			// предупреждения, потому что сам отказ пишется на уровне debug.
+			"отказов", forecast.Refused,
 				"в_очереди", queue.BySource,
 				"ждёт_модели", sched.QueueLen(),
 				"предсказано", queue.Predicted,

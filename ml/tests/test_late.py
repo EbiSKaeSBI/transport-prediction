@@ -93,7 +93,10 @@ def test_load_late_missing_files(tmp_path):
     with pytest.raises(FileNotFoundError):
         late_head.load_late(tmp_path / 'model_x_late.json')
     (tmp_path / 'model_x_late.json').write_bytes(b'{}')
-    with pytest.raises(Exception):  # metrics-сосед отсутствует
+    # Классификатор без metrics-соседа — это FileNotFoundError, а не «любое
+    # исключение»: конкретный тип позволяет отличить забытый артефакт от
+    # битого JSON, иначе тест проходит и на неверной причине падения.
+    with pytest.raises(FileNotFoundError, match='метрик'):
         late_head.load_late(tmp_path / 'model_x_late.json')
 
 

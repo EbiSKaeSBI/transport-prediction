@@ -36,6 +36,7 @@ func (BaselinePredictor) Predict(_ context.Context, f horizon.Frame) Prediction 
 		Missing:      f.Missing(),
 	}
 	if dev, ok := f.Value("cur_dev_s"); ok {
+		p.CurDevS = &dev
 		p.PredictedDevS = dev
 		p.DeltaS = 0
 		return p

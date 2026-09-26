@@ -51,6 +51,9 @@ type Config struct {
 	Store *statestore.Store
 	// Schedule — план-график для маршрутов и остановок.
 	Schedule *schedule.Schedule
+	// Holder — тот же план под перепривязку на ходу. Задаётся вместо
+	// Schedule, когда гейтвей должен видеть новый план без перезапуска.
+	Holder *schedule.Holder
 	// Binding — соответствие unit_id и tr_id.
 	Binding *schedule.Binding
 	// Predictor — цепочка прогнозов. При nil ответы не считаются, и
@@ -133,21 +136,26 @@ func New(cfg Config) *Server {
 	// Часы хранилищ те же, что у сервера: иначе тест с подменённым Now
 	// получил бы инциденты с одним временем и метрики с другим.
 	s.incidents.now = cfg.Now
-	if cfg.Schedule != nil {
-		sched := cfg.Schedule
-		s.incidents.SetScheduleLookup(func(trID, target int64) int64 {
-			stops := sched.Stops(trID)
-			for i, st := range stops {
-				if st.ActionID == target {
-					if i == 0 {
-						return 0 // цель первая: соседа нет, не выдумываем
-					}
-					return stops[i-1].ActionID
-				}
-			}
+	// Поиск соседней остановки инцидента читает план на каждый вызов, а не
+	// захватывает ссылку при старте: план-график перепривязывается на ходу, и
+	// захваченный указатель навсегда оставил бы инциденты на старой сетке
+	// остановок. Пустой Holder даёт то же поведение, что и отсутствие плана.
+	s.incidents.SetScheduleLookup(func(trID, target int64) int64 {
+		sched := currentSchedule(cfg)
+		if sched == nil {
 			return 0
-		})
-	}
+		}
+		stops := sched.Stops(trID)
+		for i, st := range stops {
+			if st.ActionID == target {
+				if i == 0 {
+					return 0 // цель первая: соседа нет, не выдумываем
+				}
+				return stops[i-1].ActionID
+			}
+		}
+		return 0
+	})
 	s.preds.now = cfg.Now
 	s.routes()
 	return s
@@ -171,6 +179,12 @@ func (s *Server) Observe(p predictor.Prediction) IncidentEvent {
 	}
 	ev := s.incidents.Update(p)
 	s.publishVehicle(p)
+	// Прежняя цель публикуется первой: карточка, которая сейчас закрывается,
+	// должна уйти из панели раньше, чем откроется следующая, иначе в ленте
+	// две тревоги одной машины меняются местами.
+	if ev.Superseded != nil {
+		s.publishIncident(*ev.Superseded)
+	}
 	if ev.Incident != nil {
 		s.publishIncident(*ev.Incident)
 	}

@@ -527,6 +527,7 @@ func (c *MLClient) prediction(f horizon.Frame, out predictResponse) (Prediction,
 	// нечего и DeltaS остаётся нулём — итог в PredictedDevS при этом
 	// честный, а неполноту кадра видно по Missing.
 	if dev, ok := f.Value("cur_dev_s"); ok {
+		p.CurDevS = &dev
 		p.DeltaS = *out.DelayS - dev
 	}
 	if out.PLate != nil {
@@ -534,6 +535,7 @@ func (c *MLClient) prediction(f horizon.Frame, out predictResponse) (Prediction,
 			return Prediction{}, fmt.Errorf("ml: p_late = %g вне [0, 1]", *out.PLate)
 		}
 		p.PLate = *out.PLate
+		p.HasPLate = true
 	}
 	// Причина едет текстом от сервиса; обрезаем по руне, а не по байту:
 	// строки русские, и обрезка посреди UTF-8 превратила бы объяснение в
@@ -774,9 +776,18 @@ func (c *MLClient) fetchInfo(ctx context.Context) (modelInfo, error) {
 }
 
 // checkNames сверяет объявленные моделью имена с контрактом кадра. Порядок не
-// важен — важно множество. Расхождение перечисляется целиком: по одному имени
-// разработчик другой стороны поймёт, что сломалось, только если это
-// единственная разница.
+// важен — важно множество.
+//
+// Сверка односторонняя, и это ровно то, что сервис уже документирует на своей
+// стороне (predictor/serve.py, module docstring): запрос может быть надмножеством
+// того, что нужно модели, поэтому модель, обученная на подмножестве признаков
+// кадра, законна и «недостающих» имён ошибкой не считается. Обратное неверно:
+// признака, которого в кадре нет, в рантайме не появится, и сервис ответит
+// 422 на каждый кадр — молчаливый отказ прогнозировать хуже явной ошибки
+// контракта при старте.
+//
+// Расхождением остаётся лишний у модели признак и дубль: дубль означает, что
+// модель считает одно и то же имя двумя разными, и согласиться с этим нельзя.
 func checkNames(got []string) error {
 	if len(got) == 0 {
 		return fmt.Errorf("%w: модель не объявила ни одного признака", ErrContractMismatch)
@@ -786,33 +797,22 @@ func checkNames(got []string) error {
 	have := slices.Clone(got)
 	sort.Strings(have)
 
-	var missing, extra []string
-	for _, n := range want {
-		if !slices.Contains(have, n) {
-			missing = append(missing, n)
-		}
-	}
+	var extra []string
 	for _, n := range have {
 		if !slices.Contains(want, n) {
 			extra = append(extra, n)
 		}
 	}
-	// Дубль в списке модели — тоже расхождение: один и тот же признак дважды
-	// означает, что модель считает их двумя разными.
 	if dup := duplicates(got); len(dup) > 0 {
 		extra = append(extra, dup...)
 	}
-	if len(missing) == 0 && len(extra) == 0 {
+	if len(extra) == 0 {
 		return nil
 	}
 	var b strings.Builder
 	b.WriteString(ErrContractMismatch.Error())
-	if len(missing) > 0 {
-		b.WriteString("; нет у модели: " + strings.Join(missing, ", "))
-	}
-	if len(extra) > 0 {
-		b.WriteString("; лишние у модели: " + strings.Join(extra, ", "))
-	}
+	b.WriteString("; лишние у модели: " + strings.Join(extra, ", "))
+	b.WriteString("; в кадре есть только: " + strings.Join(want, ", "))
 	return errors.New(b.String())
 }
 

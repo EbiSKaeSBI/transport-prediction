@@ -22,6 +22,7 @@ function card(over = {}) {
     prediction: {
       sample_id: '122658_2026-09-26T01:00:00Z', target_stop_id: 536,
       horizon_s: 720, delta_s: 12, predicted_dev_s: 132, p_late: 0.66,
+      cur_dev_s: 120,
       source: 'ml', stale: false, model_version: 'v1v3b',
       risk: 'red', as_of: AT,
     },
@@ -65,14 +66,25 @@ test('vehicle_update: карточка с прогнозом даёт vehicle+fr
   assert.equal(f.sample_id, '122658_2026-09-26T01:00:00Z')
   assert.equal(f.target_stop_id, 536)
   assert.equal(f.horizon_s, 720)
-  assert.equal(f.cur_dev_s, null) // подсказки организаторов в онлайне нет
+  assert.equal(f.cur_dev_s, 120) // измеренное отставание пришло с бэкенда
   assert.equal(f.official, false)
   assert.equal(f.risk, 'red')
   assert.equal(f.p_late, 0.66)
+  assert.equal(f.values.cur_dev_s, 120)
   assert.equal(f.values.predicted_dev_s, 132)
   assert.equal(f.values.speed_current, 34)
   assert.equal(m.model_version, 'v1v3b')
   assert.match(m.version, /v1v3b/)
+})
+
+test('vehicle_update: cur_dev_s = null — «не измерено», а не ноль', () => {
+  const a = new WireAdapter()
+  const { events } = a.decodeMessage(wire('vehicle_update',
+    card({ prediction: { ...card().prediction, cur_dev_s: null } })))
+  const f = events.find(e => e.type === 'frame')
+  assert.equal(f.cur_dev_s, null)
+  assert.equal('cur_dev_s' in f.values, false) // в значения не пишем, а не 0
+  assert.equal(f.values.predicted_dev_s, 132)
 })
 
 test('vehicle_update: «Z»-строка Go (UTC-зона процесса) парится в ту же ось epoch', () => {

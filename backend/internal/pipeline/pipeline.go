@@ -55,6 +55,10 @@ type Config struct {
 	// Binding — соответствие unit_id и tr_id. При nil — как при отсутствии
 	// Schedule: телеметрия копится, прогноза нет.
 	Binding *schedule.Binding
+	// Holder — пара «план + привязка» под перепривязку на ходу. Задаётся
+	// вместо Schedule/Binding, когда план переписывается на лету: конвейер
+	// берёт текущую пару по ссылке на каждый тик, а не копию из конфига.
+	Holder *schedule.Holder
 	// Store — накопитель телеметрии. Обязателен: без него конвейеру некуда
 	// складывать точки, и он не выполнит даже свою половину задачи.
 	Store *statestore.Store
@@ -104,6 +108,10 @@ type Pipeline struct {
 	observer *telemetry.Observer
 	planner  *horizon.Planner
 	logger   *slog.Logger
+	// holder — текущая пара «план + привязка». Берётся по ссылке на каждый
+	// тик, а не копируется в Config: план-график перепривязывается к живым
+	// машинам на ходу, и копия в конфиге осталась бы навсегда от старта.
+	holder *schedule.Holder
 
 	mu sync.Mutex
 	// lastTarget — последняя цель, по которой уже отправлен кадр, по
@@ -149,11 +157,16 @@ func New(cfg Config) (*Pipeline, error) {
 	if observer == nil {
 		observer = telemetry.New(nil, telemetry.WithLogger(logger))
 	}
+	holder := cfg.Holder
+	if holder == nil {
+		holder = schedule.NewHolder(cfg.Schedule, cfg.Binding)
+	}
 	return &Pipeline{
 		cfg:        cfg,
 		observer:   observer,
 		planner:    planner,
 		logger:     logger,
+		holder:     holder,
 		lastTarget: make(map[uint32]int64),
 		stats:      Stats{Refused: make(map[string]int64)},
 	}, nil
@@ -265,13 +278,15 @@ func (p *Pipeline) Run(ctx context.Context, every time.Duration) {
 
 // planUnit строит кадр для одного устройства на момент t.
 func (p *Pipeline) planUnit(ctx context.Context, unitID uint32, t time.Time) {
-	if p.cfg.Schedule == nil || p.cfg.Binding == nil {
+	sched := p.holder.Get()
+	binding := p.holder.GetBinding()
+	if sched == nil || binding == nil {
 		p.mu.Lock()
 		p.stats.NoPlan++
 		p.mu.Unlock()
 		return
 	}
-	trID, ok := p.cfg.Binding.TRID(unitID)
+	trID, ok := binding.TRID(unitID)
 	if !ok {
 		p.mu.Lock()
 		p.stats.NoBinding++
@@ -289,7 +304,7 @@ func (p *Pipeline) planUnit(ctx context.Context, unitID uint32, t time.Time) {
 		p.mu.Unlock()
 		return
 	}
-	window := p.cfg.Schedule.Window(trID, t.Add(-RouteWindowBefore), t.Add(RouteWindowAfter))
+	window := sched.Window(trID, t.Add(-RouteWindowBefore), t.Add(RouteWindowAfter))
 	if len(window) == 0 {
 		p.mu.Lock()
 		p.stats.NoSchedule++
@@ -360,6 +375,19 @@ func (p *Pipeline) Forget(unitID uint32) {
 	p.mu.Lock()
 	delete(p.lastTarget, unitID)
 	p.mu.Unlock()
+}
+
+// ForgetTargets снимает отметки о цели у всех устройств.
+//
+// Вызывается при перепривязке плана-графика. Новый план описывает ту же
+// остановку, но уже другими координатами и временем, поэтому пара «машина,
+// остановка» формально та же, а прогноз по ней считается заново: без сброса
+// конвейер молчал бы до следующей смены цели, то есть до ухода машины с
+// участка, ради которого план и переписывали.
+func (p *Pipeline) ForgetTargets() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	clear(p.lastTarget)
 }
 
 // Stats возвращает снимок счётчиков.

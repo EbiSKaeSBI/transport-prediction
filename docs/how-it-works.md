@@ -328,6 +328,21 @@ Go пишет прогноз в Postgres и рассылает событие п
 работает в онлайне. Иначе офлайн-метрика ничего не говорит о качестве
 прогноза на живом потоке.
 
+Тот же конвейер есть в `make`, одной командой и без расхождений с
+`ML_FEATURES`:
+
+```
+make ml-replay-frames   # шаги 1 и 3: JSONL-кадры из Go-реплея
+make ml-datasets        # predictor.dataset → dataset_{train,test,validate}.parquet
+make ml-train           # predictor.train --features "$(ML_FEATURES)" → model_v1online.json
+make ml-train-late      # predictor.late → model_v1online_late.json
+```
+
+`ML_FEATURES` — признаки, которые Go реально отдаёт в кадре. Обучение без
+этого флага даёт модель на 38 колонках, 20 из которых в кадре отсутствуют:
+MLClient отвергнет её при старте, и `make dev` молча уйдёт в baseline. Подробнее
+— в `docs/architecture.md`, §4.5.
+
 ---
 
 ## 5. Что происходит при отказах

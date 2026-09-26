@@ -202,7 +202,7 @@ func max64(v, floor int64) int64 {
 }
 
 func readyzOK(cfg Config) bool {
-	return cfg.Store != nil && cfg.Schedule != nil && cfg.Predictor != nil
+	return cfg.Store != nil && cfg.Predictor != nil && currentSchedule(cfg) != nil
 }
 
 // formatFloat печатает число в формате, который переживает разбор Prometheus.

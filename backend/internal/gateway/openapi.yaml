@@ -766,6 +766,7 @@ components:
         - sample_id
         - target_stop_id
         - horizon_s
+        - cur_dev_s
         - delta_s
         - predicted_dev_s
         - p_late
@@ -786,6 +787,15 @@ components:
           type: number
           format: double
           description: На сколько вперёд считался прогноз, секунды
+        cur_dev_s:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            Измеренное отклонение «сейчас», секунды: накопленное опоздание
+            по факту состоявшихся остановок. null, если кадр не содержал
+            фактов прошлых остановок и отклонение не измерялось. Не путать с
+            predicted_dev_s — это прогноз отклонения у цели горизонта.
         delta_s:
           type: number
           format: double
@@ -799,7 +809,12 @@ components:
           format: double
           minimum: 0
           maximum: 1
-          description: Вероятность опоздания
+          nullable: true
+          description: >-
+            Вероятность опоздания. null, если вероятности нет: у baseline и у
+            модели без P(late)-головы её не оценивали, и 0 означал бы
+            «опоздания не будет» — утверждение, которого никто не делал.
+            Панель по null показывает «—».
         reason:
           type: string
           description: >-
@@ -1046,7 +1061,7 @@ components:
           type: number
           format: double
           description: Значение, давшее красную зону
-        p_late: { type: number, format: double, minimum: 0, maximum: 1 }
+        p_late: { type: number, format: double, minimum: 0, maximum: 1, nullable: true }
         prev_stop_id:
           type: integer
           format: int64

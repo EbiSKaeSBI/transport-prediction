@@ -149,6 +149,12 @@ func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 	if p.PredictedDevS != 90 {
 		t.Errorf("отклонение %v, ожидалось 90", p.PredictedDevS)
 	}
+	// измеренное отклонение уходит на провод отдельным полем: без него
+	// панель показывает только прогноз у цели и молчит, что машина уже
+	// опоздает на измеренные 60 с
+	if p.CurDevS == nil || *p.CurDevS != 60 {
+		t.Errorf("cur_dev_s %v, ожидалось 60", p.CurDevS)
+	}
 	if p.PLate != 0.4 {
 		t.Errorf("p_late %v, ожидалось 0.4", p.PLate)
 	}
@@ -236,6 +242,35 @@ func TestContractRejectsDuplicates(t *testing.T) {
 func TestModelWithoutFeatureNamesIsMismatch(t *testing.T) {
 	if err := checkNames(nil); err == nil {
 		t.Fatal("модель без списка признаков обязана считаться несогласованной")
+	}
+}
+
+// Модель на подмножестве признаков кадра — законна: сервис получает от
+// Go-клиента всю секцию features и лишние ключи игнорирует
+// (predictor/serve.py, module docstring). Отклонять такую модель значило бы
+// заставлять переобучать её на ровно весь контракт без причины.
+func TestContractAcceptsModelFeatureSubset(t *testing.T) {
+	full := FeatureContract()
+	if len(full) < 3 {
+		t.Fatalf("контракт слишком мал для проверки: %v", full)
+	}
+	if err := checkNames(full[:2]); err != nil {
+		t.Errorf("подмножество признаков отклонено: %v", err)
+	}
+	if err := checkNames(full); err != nil {
+		t.Errorf("полный контракт отклонён: %v", err)
+	}
+}
+
+// Обратное неверно и остаётся ошибкой: признака, которого в кадре нет, в
+// рантайме не появится — сервис ответит 422 на каждый кадр.
+func TestContractRejectsFeatureMissingFromFrame(t *testing.T) {
+	err := checkNames(append(FeatureContract(), "features_of_the_future"))
+	if err == nil {
+		t.Fatal("признак, которого нет в кадре, обязано быть расхождением")
+	}
+	if !strings.Contains(err.Error(), "features_of_the_future") {
+		t.Errorf("в ошибке нет имени расхождения: %v", err)
 	}
 }
 
@@ -480,5 +515,34 @@ func TestContractCheckedOnceWhileHealthy(t *testing.T) {
 	}
 	if n := infos.Load(); n != 1 {
 		t.Errorf("обращений к /model/info %d, ожидалась 1", n)
+	}
+}
+
+// Кадр без фактов прошлых остановок: отклонение не измерено. На проволе это
+// обязано быть null, а не 0 — иначе панель напишет «опоздания нет» там, где
+// его никто не измерял, и зелёная точка станет враньём.
+func TestUnmeasuredDevStaysNil(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/model/info" {
+			_ = json.NewEncoder(w).Encode(modelInfoBody())
+			return
+		}
+		_ = json.NewEncoder(w).Encode(predictResponse{
+			DelayS: ptr(45.0), PLate: ptr(0.2), ModelVersion: "v1",
+		})
+	}))
+	defer srv.Close()
+
+	f := frameAt(t, base, 0)
+	delete(f.Values, "cur_dev_s")
+	f.Features = features.Set{}
+
+	c := NewMLClient(MLConfig{BaseURL: srv.URL})
+	p := c.Predict(t.Context(), f)
+	if p.CurDevS != nil {
+		t.Errorf("cur_dev_s %v, ожидался nil: отклонение не измерено", *p.CurDevS)
+	}
+	if p.PredictedDevS != 45 {
+		t.Errorf("прогноз %v, ожидался 45 — он остаётся честным без измерения", p.PredictedDevS)
 	}
 }

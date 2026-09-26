@@ -17,6 +17,7 @@ type stubPredictor struct {
 	calls   int
 	delay   time.Duration
 	fail    bool
+	latency time.Duration // заполняет Prediction.Latency сам, как ML-клиент
 	lastIDs []string
 }
 
@@ -38,6 +39,7 @@ func (s *stubPredictor) Predict(ctx context.Context, f horizon.Frame) predictor.
 	p := predictor.Prediction{
 		SampleID: f.SampleID, UnitID: f.UnitID, TRID: f.TRID,
 		TargetStopID: f.PrimaryStopID(), Source: predictor.SourceML,
+		Latency: s.latency,
 	}
 	if s.fail {
 		// Отказ модели наружу не выходит: это работа Fallback. Здесь он
@@ -100,6 +102,61 @@ func TestSubmitReachesPredictorAndObserver(t *testing.T) {
 	if s.Stats().BySource[predictor.SourceML] != 1 {
 		t.Errorf("ответов ml %d, ожидался 1", s.Stats().BySource[predictor.SourceML])
 	}
+}
+
+// Предиктор, который не измеряет себя сам (baseline — арифметика без сети),
+// всё равно должен попадать в окно сквозной латентности: иначе плитки
+// «прогноз целиком» и «прогнозов в секунду» в режиме без модели остаются
+// пустыми навсегда, хотя прогнозы считаются на каждом кадре.
+func TestUnmeasuredPredictorStillReportsLatency(t *testing.T) {
+	got := make(chan predictor.Prediction, 1)
+	s := New(Config{
+		Predictor: &stubPredictor{}, // Latency не заполняет
+		Observer:  func(p predictor.Prediction) { got <- p },
+		Logger:    quietLogger(),
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+
+	s.Submit(testFrame("7_1767686700", 4242))
+	select {
+	case p := <-got:
+		if p.Latency <= 0 {
+			t.Errorf("Latency = %v, ожидался замер времени прогноза", p.Latency)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("наблюдатель ничего не получил за две секунды")
+	}
+	cancel()
+	<-done
+}
+
+// Ответ предиктора с собственным замером не переписывается: ML-клиент меряет
+// сетевой вызов, и подмена на время планировщика исказила бы окно инференции.
+func TestMeasuredLatencyIsKept(t *testing.T) {
+	stub := &stubPredictor{latency: 7 * time.Millisecond}
+	got := make(chan predictor.Prediction, 1)
+	s := New(Config{
+		Predictor: stub,
+		Observer:  func(p predictor.Prediction) { got <- p },
+		Logger:    quietLogger(),
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+
+	s.Submit(testFrame("7_1767686700", 4242))
+	select {
+	case p := <-got:
+		if p.Latency != 7*time.Millisecond {
+			t.Errorf("Latency = %v, ожидались собственные 7ms предиктора", p.Latency)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("наблюдатель ничего не получил за две секунды")
+	}
+	cancel()
+	<-done
 }
 
 // Переполненная очередь обязана ронять кадры, а не блокировать конвейер.

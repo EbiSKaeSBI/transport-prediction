@@ -56,7 +56,12 @@ export class Store {
         // at-least-once доставка (live WS): повтор того же id не должен
         // сбрасывать ack уже показанного инцидента
         const exist = this.incidents.get(ev.id)
-        if (!exist) {
+        if (ev.resolved) {
+          // Закрыт на gateway: карточка больше неактуальна (риск ушёл или
+          // машина переехала на следующую цель) — убираем, чтобы рельс
+          // показывал текущую тревогу, а не историю смены
+          if (exist) this.incidents.delete(ev.id)
+        } else if (!exist) {
           this.incidents.set(ev.id, { ...ev, acked: false })
         } else if (!exist.horizon_s && ev.horizon_s) {
           // live: снимок инцидентов при подключении приходит раньше карточек

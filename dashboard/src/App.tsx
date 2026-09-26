@@ -3,10 +3,20 @@ import { Store } from './store'
 import { apiBase, detectSource } from './source'
 import type { DataSource } from './source'
 import MapView from './MapView'
+import MapBoundary from './MapBoundary'
 import type { PlanStop, RouteFC } from './geo'
 import { paintRoutes, routesFromPlan } from './geo'
 import CanvasMap from './CanvasMap'
-import { Clock, IncidentRail, MetricsPanel, ModelPanel, StreamEndedBadge, VehicleCard } from './panels'
+import {
+  Clock,
+  IncidentRail,
+  MetricsPanel,
+  ModelPanel,
+  StreamEndedBadge,
+  VehicleCard,
+  VehicleList,
+} from './panels'
+import { useStoreRev } from './useStoreRev'
 import './App.css'
 
 function hasWebGL(): boolean {
@@ -28,7 +38,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [rate, setRate] = useState<number>(60)
   const [paused, setPaused] = useState(false)
-  const [selected, setSelected] = useState<number | null>(null)
+  const [picked, setPicked] = useState<number | null>(null)
   const [live] = useState(() => {
     // То же правило, что в detectSource: live по умолчанию, replay только
     // явно (?replay или ?stream=…). Свой ?ws= тоже live.
@@ -36,6 +46,11 @@ export default function App() {
     return p.has('ws') || (p.get('replay') == null && p.get('stream') == null)
   })
   const [webgl] = useState(hasWebGL)
+  // hasWebGL() отвечает только «есть ли WebGL». Реальная карта может упасть
+  // позже (воркер maplibre, стиль), и тогда без границы ошибок React
+  // размонтирует весь дашборд. Здесь падение карты не стоит панелей.
+  const [mapFailed, setMapFailed] = useState(false)
+  const canvasFallback = !webgl || mapFailed
 
   useEffect(() => {
     let mounted = true
@@ -108,6 +123,18 @@ export default function App() {
   useEffect(() => { source?.setRate?.(rate) }, [source, rate])
   useEffect(() => { source?.setPaused?.(paused) }, [source, paused])
 
+  // Карточка ТС показывается для выбранной машины, а выбрать её на карте можно
+  // только кликом по точке в 6 пикселей. Пока машину не выбрали, показываем
+  // первую по tr_id: иначе правая колонка пустая — при одной машине это просто
+  // потерянные телеметрия и прогноз, при нескольких диспетчер вообще не видит
+  // машин, пока не угадает пиксель на карте. Значение выводится из стора, а не
+  // копится в effect: так не нужен лишний рендер, и снятие выбора кликом по
+  // другой ТС работает как раньше. Подписка нужна ради самого рендера: значение
+  // ревизии не используется, перерисовку инициирует useSyncExternalStore.
+  useStoreRev(store)
+  const firstTrId = [...store.vehicles.keys()].sort((a, b) => a - b)[0] ?? null
+  const selected = picked ?? firstTrId
+
   return (
     <div className="app">
       <header>
@@ -133,10 +160,19 @@ export default function App() {
       <main>
         <div className="map-col">
           {!webgl && <div className="warnbar">GPU/WebGL недоступен — включён canvas-фолбэк (требование офлайн-демо).</div>}
-          {webgl
-            ? <MapView store={store} routes={routes} selected={selected} onSelect={setSelected} />
-            : <CanvasMap store={store} routes={routes} selected={selected} onSelect={setSelected} />}
+          {webgl && mapFailed && <div className="warnbar">MapLibre не инициализировался (см. консоль) — включён canvas-фолбэк: карта в сетке координат, панели живут.</div>}
+          {canvasFallback
+            ? <CanvasMap store={store} routes={routes} selected={selected} onSelect={setPicked} />
+            : (
+              <MapBoundary onFailure={() => setMapFailed(true)}>
+                <MapView store={store} routes={routes} selected={selected} onSelect={setPicked} />
+              </MapBoundary>
+            )}
           <div className="legend">
+            {/* подписи — про прогноз у цели: риск и цвет считаются по нему,
+                а измеренное отклонение «сейчас» может быть другим и намеренно
+                показывается отдельной строкой в карточке ТС */}
+            <span className="legend-hint">цвет — прогноз отставания у цели:</span>
             <span><i style={{ background: '#2ecc71' }} /> &lt; 60 с</span>
             <span><i style={{ background: '#f1c40f' }} /> 60–120 с</span>
             <span><i style={{ background: '#e74c3c' }} /> ≥ 120 с (инцидент)</span>
@@ -146,6 +182,7 @@ export default function App() {
         </div>
         <aside>
           <IncidentRail store={store} stopNames={stopNames} live={live} />
+          <VehicleList store={store} selected={selected} onSelect={setPicked} />
           <VehicleCard store={store} trId={selected} />
           <MetricsPanel store={store} live={live} />
           <ModelPanel store={store} />

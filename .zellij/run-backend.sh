@@ -20,6 +20,7 @@ if [ ! -f ../plan.csv ] || [ ! -f ../binding.csv ]; then
     exec go run ./cmd/transportctl serve --listen :9201 --dry-run --stats 30s
 fi
 exec go run ./cmd/transportctl serve --listen :9201 --http :8080 \
-    --plan ../plan.csv --binding ../binding.csv \
+    --plan ../plan.csv --binding ../binding.csv --plan-watch 1s \
+    --capture-out "${EMU_CAPTURE:-../.cache/emu-capture}" \
     --ml "${ML_URL:-http://127.0.0.1:8000}" \
     --tick 5s --grid 5s --stats 30s

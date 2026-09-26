@@ -14,6 +14,7 @@ import (
 
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/horizon"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/schedule"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/statestore"
 )
 
@@ -48,6 +49,35 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeError(w http.ResponseWriter, code int, kind, detail string, more ...string) {
 	writeJSON(w, code, errorBody{Error: kind, Detail: detail, Errors: more})
+}
+
+// schedule — текущий план-график: из Holder, если он задан, иначе из
+// конфига. Два источника нужны для тестов и для режима без перепривязки;
+// приоритет у Holder, потому что перепривязка обязана быть видна всем
+// обработчикам, а не только конвейеру.
+func (s *Server) schedule() *schedule.Schedule {
+	return currentSchedule(s.cfg)
+}
+
+// currentSchedule — актуальный план: из holder, если перепривязка включена,
+// иначе из статического конфига. Функция на уровне конфига, а не метод
+// Server, потому что её же зовёт замыкание поиска соседней остановки из New,
+// где Server ещё не собран.
+func currentSchedule(cfg Config) *schedule.Schedule {
+	if cfg.Holder != nil {
+		return cfg.Holder.Get()
+	}
+	return cfg.Schedule
+}
+
+// currentBinding — актуальная привязка, по тем же правилам, что и план:
+// держать в двух местах означило бы показать на карте одно, а в incident —
+// другое после первой же перезаписи файла.
+func currentBinding(cfg Config) *schedule.Binding {
+	if cfg.Holder != nil {
+		return cfg.Holder.GetBinding()
+	}
+	return cfg.Binding
 }
 
 // health — ответ /healthz. Живость, а не готовность: процесс отвечает, и это
@@ -148,19 +178,39 @@ type vehicleView struct {
 
 // predictionView — прогноз в ответе API.
 type predictionView struct {
-	SampleID      string           `json:"sample_id"`
-	TargetStopID  int64            `json:"target_stop_id"`
-	HorizonS      float64          `json:"horizon_s"`
-	DeltaS        float64          `json:"delta_s"`
-	PredictedDevS float64          `json:"predicted_dev_s"`
-	PLate         float64          `json:"p_late"`
-	Reason        string           `json:"reason,omitempty"`
-	Source        predictor.Source `json:"source"`
-	Stale         bool             `json:"stale"`
-	ModelVersion  string           `json:"model_version,omitempty"`
-	Missing       []string         `json:"missing_features"`
-	Risk          Risk             `json:"risk"`
-	AsOf          time.Time        `json:"as_of"`
+	SampleID      string  `json:"sample_id"`
+	TargetStopID  int64   `json:"target_stop_id"`
+	HorizonS      float64 `json:"horizon_s"`
+	// CurDevS — измеренное отклонение «сейчас». null, если кадр не дал
+	// фактов прошлых остановок: отсутствие замера и нулевое отклонение —
+	// разные вещи, и панель обязана их различать.
+	CurDevS       *float64        `json:"cur_dev_s"`
+	DeltaS        float64         `json:"delta_s"`
+	PredictedDevS float64         `json:"predicted_dev_s"`
+	// PLate — указатель не из любви к указателям: у прогноза может не быть
+	// вероятности (baseline, модель без P(late)-головы), и тогда на проводе
+	// должно быть null, а не 0. Ключ остаётся обязательным — меняется значение,
+	// а не форма ответа. Панель по null пишет «—» вместо «0%».
+	PLate        *float64         `json:"p_late"`
+	Reason       string           `json:"reason,omitempty"`
+	Source       predictor.Source `json:"source"`
+	Stale        bool             `json:"stale"`
+	ModelVersion string           `json:"model_version,omitempty"`
+	Missing      []string         `json:"missing_features"`
+	Risk         Risk             `json:"risk"`
+	AsOf         time.Time        `json:"as_of"`
+}
+
+// plateOrNil — вероятность опоздания или nil, если её нет. Ноль и «головы нет»
+// различаются здесь, на границе, иначе оба случая уедут на дашборд как 0% и
+// панель будет утверждать «опоздания не будет» там, где вероятность никто
+// не считал.
+func plateOrNil(p predictor.Prediction) *float64 {
+	if !p.HasPLate {
+		return nil
+	}
+	v := p.PLate
+	return &v
 }
 
 // viewOf превращает прогноз в вид ответа.
@@ -169,9 +219,10 @@ func viewOf(p predictor.Prediction) predictionView {
 		SampleID:      p.SampleID,
 		TargetStopID:  p.TargetStopID,
 		HorizonS:      p.HorizonS,
+		CurDevS:       p.CurDevS,
 		DeltaS:        p.DeltaS,
 		PredictedDevS: p.PredictedDevS,
-		PLate:         p.PLate,
+		PLate:         plateOrNil(p),
 		Reason:        p.Reason,
 		Source:        p.Source,
 		Stale:         p.Stale,
@@ -211,8 +262,8 @@ func (s *Server) vehicles(w http.ResponseWriter, r *http.Request) {
 // расхождение видно только глазами на карте.
 func (s *Server) vehicle(unit uint32) vehicleView {
 	v := vehicleView{UnitID: unit}
-	if s.cfg.Binding != nil {
-		if tr, ok := s.cfg.Binding.TRID(unit); ok {
+	if b := currentBinding(s.cfg); b != nil {
+		if tr, ok := b.TRID(unit); ok {
 			v.TRID, v.HasTRID = tr, true
 		}
 	}
@@ -330,7 +381,8 @@ func (s *Server) trajectory(w http.ResponseWriter, r *http.Request) {
 // отдельной сущности маршрута в исходных данных нет, а вводить её значило бы
 // изобрести структуру, которой в расписании не соответствует ничего.
 func (s *Server) routes_(w http.ResponseWriter, _ *http.Request) {
-	if s.cfg.Schedule == nil {
+	sched := s.schedule()
+	if sched == nil {
 		writeError(w, http.StatusServiceUnavailable, "schedule_unavailable",
 			"нет плана-графика")
 		return
@@ -341,11 +393,11 @@ func (s *Server) routes_(w http.ResponseWriter, _ *http.Request) {
 		FirstAt *time.Time `json:"first_planned"`
 		LastAt  *time.Time `json:"last_planned"`
 	}
-	trids := s.cfg.Schedule.Vehicles()
+	trids := sched.Vehicles()
 	slices.Sort(trids)
 	out := make([]routeView, 0, len(trids))
 	for _, tr := range trids {
-		stops := s.cfg.Schedule.Stops(tr)
+		stops := sched.Stops(tr)
 		rv := routeView{TRID: tr, Stops: len(stops)}
 		if len(stops) > 0 {
 			first, last := stops[0].TimeBegin, stops[len(stops)-1].TimeBegin
@@ -358,7 +410,8 @@ func (s *Server) routes_(w http.ResponseWriter, _ *http.Request) {
 
 // routeStops — GET /api/v1/routes/{id}/stops.
 func (s *Server) routeStops(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.Schedule == nil {
+	sched := s.schedule()
+	if sched == nil {
 		writeError(w, http.StatusServiceUnavailable, "schedule_unavailable",
 			"нет плана-графика")
 		return
@@ -368,7 +421,7 @@ func (s *Server) routeStops(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
 		return
 	}
-	stops := s.cfg.Schedule.Stops(tr)
+	stops := sched.Stops(tr)
 	if len(stops) == 0 {
 		writeError(w, http.StatusNotFound, "not_found",
 			fmt.Sprintf("у транспортного средства %d остановок в расписании нет", tr))

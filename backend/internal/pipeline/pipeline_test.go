@@ -332,6 +332,71 @@ func TestTickEmitsAgainWhenTargetChanges(t *testing.T) {
 	}
 }
 
+// Перепривязка плана на ходу: конвейер обязан брать текущую пару, а не ту,
+// что была в конфиге на старте. Иначе перезаписанный plan.csv читался бы, но
+// прогноз продолжал бы считать по старой геометрии — тихо и без единого признака.
+func TestTickUsesReloadedPlanFromHolder(t *testing.T) {
+	sink := &frameSink{}
+	plan := &schedule.Schedule{}
+	bind := &schedule.Binding{}
+	if err := reloadFixtures(t, plan, bind, routeStops()); err != nil {
+		t.Fatalf("не удалось собрать расписание: %v", err)
+	}
+	holder := schedule.NewHolder(plan, bind)
+	store := statestore.New(
+		statestore.WithClock(func() time.Time { return base.Add(30 * time.Minute) }),
+	)
+	p, err := New(Config{Holder: holder, Store: store, Sink: sink})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	appendStanding(t, p, base, routeStops()[1].Lon, routeStops()[1].Lat)
+	p.Tick(context.Background(), base)
+	if got := sink.all(); len(got) != 1 {
+		t.Fatalf("кадров до перепривязки %d, ожидался 1", len(got))
+	}
+
+	// Новый план: та же остановка в окне, но другой идентификатор и время.
+	shifted := make([]schedule.Stop, len(routeStops()))
+	for i, st := range routeStops() {
+		shifted[i] = st
+		shifted[i].ActionID = st.ActionID + 5000
+	}
+	newPlan := &schedule.Schedule{}
+	newBind := &schedule.Binding{}
+	if err := reloadFixtures(t, newPlan, newBind, shifted); err != nil {
+		t.Fatalf("не удалось собрать новое расписание: %v", err)
+	}
+	holder.Swap(newPlan, newBind)
+	// и забываем цели: пара «машина, остановка» формально другая только по
+	// времени, а кадр по ней всё равно должен быть построен заново
+	p.ForgetTargets()
+	// тик в следующей ячейке сетки, иначе кадр не родится вовсе — а не из-за
+	// плана, а из-за привязки момента прогноза
+	appendStanding(t, p, base.Add(5*time.Minute), routeStops()[3].Lon, routeStops()[3].Lat)
+	p.Tick(context.Background(), base.Add(5*time.Minute))
+
+	frames := sink.all()
+	if len(frames) != 2 {
+		t.Fatalf("кадров после перепривязки %d, ожидалось 2: конвейер не увидел новый план", len(frames))
+	}
+	// Сдвинули все идентификаторы на 5000, поэтому цель из старого плана
+	// неотличима от новой только по координатам — а вот по номеру отличима
+	// однозначно. Смещение времени в тестовом плане не менялось, так что
+	// ожидаем ровно ту же остановку окна, но с другим идентификатором.
+	got := frames[1].PrimaryStopID()
+	if got < 5000 {
+		t.Fatalf("цель %d взята из старого плана: holder не отдался вовремя", got)
+	}
+	stop, ok := newPlan.StopByID(got)
+	if !ok {
+		t.Fatalf("цель %d отсутствует в новом плане", got)
+	}
+	if stop.ActionID != got {
+		t.Errorf("у остановки %d идентификатор %d", got, stop.ActionID)
+	}
+}
+
 // Устройство без единицы в расписании не должно ронять конвейер и не должно
 // получать кадр: предсказывать ему нечего.
 func TestTickSkipsUnboundUnit(t *testing.T) {

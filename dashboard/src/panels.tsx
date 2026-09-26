@@ -1,13 +1,21 @@
-import { useSyncExternalStore } from 'react'
 import * as echarts from 'echarts'
 import { useEffect, useRef, useState } from 'react'
 import type { Store } from './store'
 import type { FrameEvent } from './types'
 import { apiBase } from './source'
 import { formatClock } from './time'
+import { RISK_COLORS, vehicleRisk } from './risk'
+import { useStoreRev } from './useStoreRev'
 
-function useStoreRev(store: Store): number {
-  return useSyncExternalStore(store.subscribe, store.getSnapshot)
+/**
+ * baseline — не модель, а повтор измеренного отставания (predictor/baseline.go).
+ * Число в карточке реальное, но называть его «прогнозом» нельзя: панель
+ * обязана показывать, что оценка копится из факта, а не предсказана.
+ */
+function isFallback(i: { source?: string }): boolean {
+  // источник приходит и как 'baseline' (кадр прогноза), и как
+  // 'gateway:baseline' (карточка инцидента) — правило одно на оба
+  return (i.source ?? '').endsWith('baseline')
 }
 
 export function Clock({ store }: { store: Store }) {
@@ -36,7 +44,7 @@ export function IncidentRail({ store, stopNames, live }: {
           <li key={i.id} className={i.acked ? 'acked' : ''}>
             <div className="row1">
               <b>+{Math.round(i.predicted_delay_s)} с</b>
-              <span className="muted">опоздание · ТС {i.tr_id}</span>
+              <span className="muted">{isFallback(i) ? 'отставание сейчас' : 'опоздание'} · ТС {i.tr_id}</span>
             </div>
             <div className="row2">
               {i.prev_stop_id != null && (
@@ -46,9 +54,11 @@ export function IncidentRail({ store, stopNames, live }: {
             </div>
             <div className="row3 muted">
               {formatClock(i.ts)} · горизонт {(i.horizon_s / 60).toFixed(1)} мин
-              {i.p_late != null && ` · P(опозд.) ${(i.p_late * 100).toFixed(0)}%`} · {i.reason}
+              {i.p_late != null ? ` · P(опозд.) ${(i.p_late * 100).toFixed(0)}%` : ' · P(опозд.) —'} · {i.reason}
             </div>
-            <div className="row3 muted">модель: {i.source}</div>
+            <div className="row3 muted">
+              {isFallback(i) ? 'оценка: правило-эталон, модель не подключена' : `модель: ${i.source}`}
+            </div>
             {!i.acked && (
               <button onClick={() => {
                 if (live) fetch(`/api/v1/incidents/${encodeURIComponent(i.id)}/ack`, { method: 'POST' }).catch(() => {})
@@ -80,12 +90,66 @@ const FEATURE_LABELS: Record<string, string> = {
   lag_s: 'лаг приёма, с',
 }
 
+export function VehicleList({ store, selected, onSelect }: {
+  store: Store
+  selected: number | null
+  onSelect: (trId: number) => void
+}) {
+  useStoreRev(store)
+  const rows = [...store.vehicles.values()].sort((a, b) => a.tr_id - b.tr_id)
+  if (rows.length <= 1) return null
+  return (
+    <section className="panel">
+      <h2>Транспорт ({rows.length})</h2>
+      {/* Список нужен при нескольких машинах: карточка ниже показывает одну
+          выбранную, а выбрать машину можно только кликом по точке на карте —
+          без списка правая колонка остаётся пустой, пока диспетчер не угадает
+          пиксель. Строка = измерение сейчас и прогноз у цели рядом, риск
+          показан тем же цветом, что и точка на карте. */}
+      <table className="kv">
+        <tbody>
+          {rows.map((v) => {
+            const f = v.lastFrame
+            const risk = vehicleRisk(v, store.clock)
+            const hasPrediction = f != null && (f.source != null || f.values.predicted_dev_s != null)
+            return (
+              <tr
+                key={v.tr_id}
+                className={`list-row${v.tr_id === selected ? ' row-selected' : ''}`}
+                onClick={() => onSelect(v.tr_id)}
+              >
+                <td>
+                  <i className="dot" style={{ background: RISK_COLORS[risk] }} /> ТС {v.tr_id}
+                </td>
+                <td>
+                  {f?.values.cur_dev_s != null ? `${Math.round(f.values.cur_dev_s)} с` : '—'}
+                </td>
+                <td>
+                  {hasPrediction && f?.values.predicted_dev_s != null
+                    ? `${Math.round(f.values.predicted_dev_s)} с`
+                    : '—'}
+                </td>
+                <td>{f?.p_late != null ? `${(f.p_late * 100).toFixed(0)}%` : '—'}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+      <div className="hint">измеренное сейчас · прогноз у цели · P(опозд.)</div>
+    </section>
+  )
+}
+
 export function VehicleCard({ store, trId }: { store: Store; trId: number | null }) {
   useStoreRev(store)
   if (trId == null) return null
   const v = store.vehicles.get(trId)
   if (!v) return null
   const f: FrameEvent | null = v.lastFrame
+  // Офлайн-кадр из demo/stream.ndjson несёт только признаки: там нет ни
+  // прогноза, ни источника, и рисовать «прогноз отставания 0 с» значило бы
+  // выдумать оценку. Блок прогноза — только там, где он реально пришёл.
+  const hasPrediction = f != null && (f.source != null || f.values.predicted_dev_s != null)
   return (
     <section className="panel">
       <h2>ТС {v.tr_id}</h2>
@@ -97,7 +161,53 @@ export function VehicleCard({ store, trId }: { store: Store; trId: number | null
         </tbody>
       </table>
       {f ? (
-        <table className="kv">
+        <>
+          {hasPrediction && (
+            <table className="kv">
+              <tbody>
+                {/* Измеренное отставание в этом блоке не повторяется: оно уже
+                    есть в телеметрии ниже, рядом со скоростью и свежестью
+                    данных. Здесь только прогноз — иначе одно и то же число
+                    читается дважды и рушит смысл разделения. */}
+                {isFallback(f!) ? (
+                  /* baseline по построению повторяет измеренное: называть его
+                     «прогнозом» нельзя, поэтому строки прогноза нет. */
+                  <tr>
+                    <td>прогноз</td>
+                    <td>baseline — копия измеренного</td>
+                  </tr>
+                ) : (
+                  <tr>
+                    <td>прогноз отставания, с</td>
+                    <td>{Math.round(f.values.predicted_dev_s ?? 0)}</td>
+                  </tr>
+                )}
+                <tr>
+                  <td>источник</td>
+                  <td>
+                    {isFallback(f!)
+                      ? 'baseline — модель не подключена'
+                      : f.source
+                        ? `модель ${f.model_version ?? f.source}`
+                        : 'не указан (replay-кадр)'}
+                  </td>
+                </tr>
+                <tr>
+                  <td>P(опозд.)</td>
+                  {/* нет вероятности — это «не оценивали», а не 0% */}
+                  <td>{f.p_late != null ? `${(f.p_late * 100).toFixed(0)}%` : '—'}</td>
+                </tr>
+                {f.reason && <tr><td>причина</td><td>{f.reason}</td></tr>}
+                {f.missing != null && f.missing.length > 0 && (
+                  <tr>
+                    <td>не хватает признаков</td>
+                    <td>{f.missing.length} — {f.missing.join(', ')}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          )}
+          <table className="kv">
           <tbody>
             {Object.entries(FEATURE_LABELS).map(([key, label]) => {
               const val = key === 'cur_dev_s' ? f.cur_dev_s : f.values[key]
@@ -107,6 +217,7 @@ export function VehicleCard({ store, trId }: { store: Store; trId: number | null
             {f.ambiguous && <tr><td>цель</td><td>две кандидатуры (ничья в плане)</td></tr>}
           </tbody>
         </table>
+        </>
       ) : <p className="muted">Прогнозных кадров по этому ТС ещё не было.</p>}
     </section>
   )
@@ -193,7 +304,7 @@ export function MetricsPanel({ store, live }: { store: Store; live: boolean }) {
               <td>{snap?.queue ? `${snap.queue.depth} / ${snap.queue.dropped}` : '—'}</td></tr>
             <tr><td>прогнозов в секунду</td>
               <td>{snap?.throughput ? snap.throughput.predictions_per_s.toFixed(3) : '—'}</td></tr>
-            <tr><td>лента · подписчиков</td>
+            <tr><td>лента · отправлено / подписчиков</td>
               <td>{snap?.stream ? `${snap.stream.sent_total} / ${snap.stream.clients}` : '—'}</td></tr>
           </tbody>
         </table>

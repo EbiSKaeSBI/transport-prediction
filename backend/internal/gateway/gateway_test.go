@@ -64,10 +64,12 @@ func get(t *testing.T, s *Server, path string, want int) map[string]any {
 
 // predictionAt собирает прогноз для тестов инцидентов.
 func predictionAt(unit uint32, dev, plate float64) predictor.Prediction {
+	d := dev - 30
 	return predictor.Prediction{
 		SampleID: "7_1767686400", UnitID: unit, TRID: 7,
 		AsOf: base, TargetStopID: 114, HorizonS: 600,
-		PredictedDevS: dev, PLate: plate, Source: predictor.SourceML,
+		CurDevS: &d, PredictedDevS: dev, PLate: plate, HasPLate: true,
+		Source: predictor.SourceML,
 	}
 }
 
@@ -236,7 +238,66 @@ func TestPredictionRoundTrip(t *testing.T) {
 	if body["risk"] != string(RiskRed) {
 		t.Errorf("риск %v при отклонении 180, ожидался red", body["risk"])
 	}
+	// измеренное отклонение «сейчас» едет рядом с прогнозом у цели: без него
+	// панель не может объяснить зелёный цвет машины, которая уже позади
+	if body["cur_dev_s"] != float64(150) {
+		t.Errorf("cur_dev_s %v, ожидалось 150", body["cur_dev_s"])
+	}
 	get(t, s, "/api/v1/predictions/нет-такого", http.StatusNotFound)
+}
+
+// Нулевая вероятность и отсутствие вероятности — разные вещи, и провод обязан
+// это различать. Baseline не оценивает вероятность вовсе, поэтому p_late едет
+// null; 0 означал бы «опоздания не будет» — утверждение, которого никто не
+// делал, и панель показывала бы его как уверенный прогноз.
+func TestBaselinePlateIsNullNotZero(t *testing.T) {
+	s := testServer(t)
+	p := predictionAt(4242, 180, 0)
+	p.Source = predictor.SourceBaseline
+	p.PLate = 0
+	p.HasPLate = false
+	p.Reason = ""
+	s.Observe(p)
+
+	body := get(t, s, "/api/v1/predictions/7_1767686400", http.StatusOK)
+	v, ok := body["p_late"]
+	if !ok {
+		t.Fatal("ключ p_late обязан присутствовать: меняется значение, а не форма ответа")
+	}
+	if v != nil {
+		t.Errorf("p_late %v у baseline, ожидался null", v)
+	}
+}
+
+// У модели с головой вероятностей число обязано дойти без искажения.
+func TestModelPlateReachesWire(t *testing.T) {
+	s := testServer(t)
+	s.Observe(predictionAt(4242, 180, 0.8))
+
+	body := get(t, s, "/api/v1/predictions/7_1767686400", http.StatusOK)
+	if body["p_late"] != float64(0.8) {
+		t.Errorf("p_late %v, ожидалось 0.8", body["p_late"])
+	}
+}
+
+// Карточка инцидента наследует то же правило: у инцидента, открытого по
+// отклонению без модели, вероятности тоже нет.
+func TestIncidentPlateIsNullForBaseline(t *testing.T) {
+	s := testServer(t)
+	p := predictionAt(4242, 180, 0)
+	p.Source = predictor.SourceBaseline
+	p.HasPLate = false
+	s.Observe(p)
+
+	incs := get(t, s, "/api/v1/incidents?status=open", http.StatusOK)
+	list, _ := incs["incidents"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("открытых инцидентов %d, ожидался 1: %v", len(list), incs)
+	}
+	card, _ := list[0].(map[string]any)
+	if v, ok := card["p_late"]; !ok || v != nil {
+		t.Errorf("p_late в карточке инцидента %v (ключ есть: %v), ожидался null", v, ok)
+	}
 }
 
 // Прогноз, посчитанный через POST, обязан попасть в карточку машины: иначе
@@ -440,7 +501,7 @@ func (p *stubPredictor) Predict(_ context.Context, f horizon.Frame) predictor.Pr
 		SampleID: f.SampleID, UnitID: f.UnitID, TRID: f.TRID, AsOf: f.AsOf,
 		TargetStopID: f.PrimaryStopID(), HorizonS: f.HorizonS(),
 		DeltaS: p.delta, PredictedDevS: dev + p.delta, PLate: p.plate,
-		Source: predictor.SourceML,
+		HasPLate: true, Source: predictor.SourceML,
 	}
 }
 

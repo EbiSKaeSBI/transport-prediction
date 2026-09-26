@@ -74,6 +74,74 @@ export function routesFromPlan(lists: PlanStop[][]): RouteFC {
   return { type: 'FeatureCollection', features }
 }
 
+/** Границы в порядке maplibre: [[запад, юг], [восток, север]]. */
+export type Bounds = [[number, number], [number, number]]
+
+/** Прямоугольник, вмещающий оба источника; null, если оба пусты. */
+export function mergeBounds(a: Bounds | null, b: Bounds | null): Bounds | null {
+  if (!a) return b
+  if (!b) return a
+  return [
+    [Math.min(a[0][0], b[0][0]), Math.min(a[0][1], b[0][1])],
+    [Math.max(a[1][0], b[1][0]), Math.max(a[1][1], b[1][1])],
+  ]
+}
+
+/** Границы точек машин; с запасом, чтобы маркер не липнул к краю холста. */
+export function pointsBounds(
+  pts: Iterable<{ lon: number; lat: number }>,
+  eps = 0.002,
+): Bounds | null {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+  for (const p of pts) {
+    if (!Number.isFinite(p.lon) || !Number.isFinite(p.lat)) continue
+    minX = Math.min(minX, p.lon); maxX = Math.max(maxX, p.lon)
+    minY = Math.min(minY, p.lat); maxY = Math.max(maxY, p.lat)
+  }
+  if (!Number.isFinite(minX)) return null
+  return [[minX - eps, minY - eps], [maxX + eps, maxY + eps]]
+}
+
+/**
+ * «Круглый» шаг сетки, дающий примерно target линий на сторону: 0.05, 0.1,
+ * 0.25, 0.5, 1, 2, 5 … Вместо произвольных долей градуса подписи сетки
+ * читаются глазами, а не выглядят как шум.
+ */
+export function niceStep(span: number, target = 6): number {
+  if (!(span > 0) || !Number.isFinite(span)) return 0.1
+  const raw = span / target
+  const mag = 10 ** Math.floor(Math.log10(raw))
+  const norm = raw / mag
+  return (norm >= 5 ? 10 : norm >= 2 ? 5 : norm >= 1 ? 2 : 1) * mag
+}
+
+/**
+ * Сетка координат по границам — офлайн-аналог подложки. Без тайлов демо
+ * выглядит как карта, а не как пустой фон (docs/architecture.md §6: сети нет
+ * и быть не должно, а ощущение масштаба и ориентации нужно).
+ */
+export function graticuleFC(b: Bounds | null, step: number): RouteFC {
+  const empty: RouteFC = { type: 'FeatureCollection', features: [] }
+  if (!b || !(step > 0) || !Number.isFinite(step)) return empty
+  const [[w, s], [e, n]] = b
+  const lines: RouteFC['features'] = []
+  const seg = (a: [number, number], c: [number, number]) => {
+    if (lines.length >= 200) return
+    lines.push({
+      type: 'Feature',
+      properties: { kind: 'grid' },
+      geometry: { type: 'LineString', coordinates: [a, c] },
+    })
+  }
+  for (let lon = Math.ceil(w / step) * step; lon <= e; lon += step) {
+    seg([lon, s], [lon, n])
+  }
+  for (let lat = Math.ceil(s / step) * step; lat <= n; lat += step) {
+    seg([w, lat], [e, lat])
+  }
+  return { type: 'FeatureCollection', features: lines }
+}
+
 export function routesBounds(fc: RouteFC | null): [[number, number], [number, number]] | null {
   if (!fc) return null
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity

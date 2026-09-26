@@ -13,6 +13,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/horizon"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
@@ -278,7 +279,17 @@ func (s *Scheduler) predictBatch(ctx context.Context, frames []horizon.Frame) {
 }
 
 func (s *Scheduler) predict(ctx context.Context, frame horizon.Frame) {
+	// Замер сквозного времени прогноза. Предиктор, который сам измеряет
+	// сетевой вызов (ML-клиент), заполняет Latency сам; baseline этого не
+	// делает, и без замера окно prediction_latency остаётся пустым — плитки
+	// «прогноз целиком» и «прогнозов в секунду» в режиме без модели не
+	// наполняются никогда, хотя прогнозы считаются. Ноль означает «не
+	// измерено», поэтому заполняем только незаполненное.
+	start := time.Now()
 	p := s.cfg.Predictor.Predict(ctx, frame)
+	if p.Latency == 0 {
+		p.Latency = time.Since(start)
+	}
 	s.mu.Lock()
 	s.stats.Predicted++
 	s.stats.BySource[p.Source]++

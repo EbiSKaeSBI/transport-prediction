@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -43,6 +44,66 @@ type captureHandler struct {
 	byType    map[string]int
 	limit     int
 	cancel    context.CancelFunc
+	// lastFlush — когда в буфер последний раз сбрасывали на диск. Запись
+	// читает генератор плана, не дожидаясь остановки сервера, поэтому хвост
+	// буфера обязан попадать в файл сам, а не в момент закрытия.
+	lastFlush time.Time
+	closers   []io.Closer
+}
+
+// captureFlushEvery — как часто сбрасывать буфер записи на диск. Секунда с
+// запасом: план строится по последней позиции машины, и секунда давности на
+// метке времени не влияет на выбор остановки, а вот недописанный кадр в файл
+// попасть не должен.
+const captureFlushEvery = time.Second
+
+// newCaptureHandler открывает каталог записи и возвращает готовый обработчик
+// вместе с func для закрытия файлов. Живёт отдельно от runCapture, потому что
+// ту же запись ведёт и сервер: план должен строиться ровно по тому потоку,
+// который уже ест конвейер, а не по второму подключению к источнику.
+func newCaptureHandler(out string, limit int,
+	cancel context.CancelFunc,
+) (*captureHandler, func(), error) {
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		return nil, nil, fmt.Errorf("не удалось создать %s: %w", out, err)
+	}
+	binFile, err := os.Create(filepath.Join(out, "packets.bin"))
+	if err != nil {
+		return nil, nil, err
+	}
+	metaFile, err := os.Create(filepath.Join(out, "packets.jsonl"))
+	if err != nil {
+		binFile.Close()
+		return nil, nil, err
+	}
+	closeAll := func() {
+		binFile.Close()
+		metaFile.Close()
+	}
+	h := &captureHandler{
+		bin:       bufio.NewWriter(binFile),
+		meta:      bufio.NewWriter(metaFile),
+		units:     map[uint32]int{},
+		byType:    map[string]int{},
+		limit:     limit,
+		cancel:    cancel,
+		lastFlush: time.Now(),
+		closers:   []io.Closer{binFile, metaFile},
+	}
+	return h, closeAll, nil
+}
+
+// flushIfDue сбрасывает буферы, если с прошлого раза прошла секунда. Под
+// мьютексом: буферы пишутся из обработчиков соединений, и flush без блокировки
+// гонялся бы с записью.
+func (h *captureHandler) flushIfDue() {
+	now := time.Now()
+	if now.Sub(h.lastFlush) < captureFlushEvery {
+		return
+	}
+	h.lastFlush = now
+	h.bin.Flush()
+	h.meta.Flush()
 }
 
 func (h *captureHandler) OnHandshake(unitID uint32, req ndtp.ConnRequest) {
@@ -52,6 +113,11 @@ func (h *captureHandler) OnHandshake(unitID uint32, req ndtp.ConnRequest) {
 }
 
 func (h *captureHandler) OnRealtime(unitID uint32, frame ndtp.Frame, cells []ndtp.Cell) {
+	// Мьютекс берётся до чтения h.seq и записи h.byType: сокетов на каждый
+	// unitId свой, и без блокировки несколько юнитов роняют процесс
+	// «concurrent map writes» прямо в подсчёте ячеек.
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	record := frameRecord{
 		Seq:       h.seq,
 		UnitID:    unitID,
@@ -71,11 +137,10 @@ func (h *captureHandler) OnRealtime(unitID uint32, frame ndtp.Frame, cells []ndt
 		})
 	}
 
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.bin.Write(frame.Raw)
 	json.NewEncoder(h.meta).Encode(record)
 	h.seq++
+	h.flushIfDue()
 	if h.limit > 0 && h.seq >= h.limit {
 		h.bin.Flush()
 		h.meta.Flush()
@@ -105,6 +170,30 @@ func (h *captureHandler) OnMalformed(unitID uint32, frame ndtp.Frame, err error)
 
 func (h *captureHandler) OnDisconnect(unitID uint32) {}
 
+// Flush сбрасывает буферы записи на диск.
+func (h *captureHandler) Flush() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.bin.Flush()
+	h.meta.Flush()
+}
+
+// snapshot отдаёт сводку записи для печати. Под мьютексом, иначе счётчики
+// читаются посреди записи и в отчёте бывают отрицательные дельты.
+func (h *captureHandler) snapshot() (int, int, map[uint32]int, map[string]int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	units := make(map[uint32]int, len(h.units))
+	for unit, count := range h.units {
+		units[unit] = count
+	}
+	byType := make(map[string]int, len(h.byType))
+	for name, count := range h.byType {
+		byType[name] = count
+	}
+	return h.seq, h.malformed, units, byType
+}
+
 func runCapture(args []string) error {
 	fs := flag.NewFlagSet("ndtp-capture", flag.ContinueOnError)
 	listen := fs.String("listen", ":9201", "адрес прослушивания NDTP")
@@ -121,31 +210,14 @@ func runCapture(args []string) error {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	}
 
-	if err := os.MkdirAll(*out, 0o755); err != nil {
-		return fmt.Errorf("не удалось создать %s: %w", *out, err)
-	}
-	binFile, err := os.Create(filepath.Join(*out, "packets.bin"))
-	if err != nil {
-		return err
-	}
-	defer binFile.Close()
-	metaFile, err := os.Create(filepath.Join(*out, "packets.jsonl"))
-	if err != nil {
-		return err
-	}
-	defer metaFile.Close()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	handler := &captureHandler{
-		bin:    bufio.NewWriter(binFile),
-		meta:   bufio.NewWriter(metaFile),
-		units:  map[uint32]int{},
-		byType: map[string]int{},
-		limit:  *limit,
-		cancel: cancel,
+	handler, closeAll, err := newCaptureHandler(*out, *limit, cancel)
+	if err != nil {
+		return err
 	}
+	defer closeAll()
 	server := &ndtpserver.Server{
 		Addr:    *listen,
 		Handler: handler,
@@ -166,15 +238,16 @@ func runCapture(args []string) error {
 
 	handler.bin.Flush()
 	handler.meta.Flush()
+	seq, malformed, units, byType := handler.snapshot()
 
-	fmt.Printf("пакетов: %d\n", handler.seq)
-	fmt.Printf("не разобрано: %d\n", handler.malformed)
-	fmt.Printf("устройств: %d\n", len(handler.units))
-	for unit, count := range handler.units {
+	fmt.Printf("пакетов: %d\n", seq)
+	fmt.Printf("не разобрано: %d\n", malformed)
+	fmt.Printf("устройств: %d\n", len(units))
+	for unit, count := range units {
 		fmt.Printf("  unit %d: %d handshake\n", unit, count)
 	}
 	fmt.Println("типы ячеек:")
-	for name, count := range handler.byType {
+	for name, count := range byType {
 		fmt.Printf("  %-20s %d\n", name, count)
 	}
 	fmt.Printf("файлы: %s/packets.bin, %s/packets.jsonl\n", *out, *out)

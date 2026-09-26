@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { Store } from './store'
 import type { RouteFC } from './geo'
-import { routeColor, routeGeometries } from './geo'
+import { routeColor, routeGeometries, routesBounds, mergeBounds, pointsBounds, graticuleFC, niceStep } from './geo'
 import { RISK_COLORS, vehicleRisk, riskSegmentsFC } from './risk'
 
 interface Props {
@@ -45,34 +45,23 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
     resize()
     window.addEventListener('resize', resize)
 
-    let bounds = (() => {
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-      const eat = (c: unknown) => {
-        if (Array.isArray(c)) {
-          if (typeof c[0] === 'number' && typeof c[1] === 'number') {
-            minX = Math.min(minX, c[0]); maxX = Math.max(maxX, c[0])
-            minY = Math.min(minY, c[1]); maxY = Math.max(maxY, c[1])
-          } else for (const p of c) eat(p)
-        }
+    // Рамка — по плану и по позициям ТС одновременно, один раз. План без машин
+    // не берём: демо-фид кладёт телеметрию в 8 км от плана, и рамка только по
+    // нему оставляет все точки вне холста (тот же грабли, что в MapView).
+    let bounds: { minX: number; minY: number; maxX: number; maxY: number } | null = null
+    const ensureBounds = () => {
+      if (bounds) return
+      const plan = routesBounds(routes)
+      const pts = pointsBounds(store.vehicles.values())
+      if (plan && !pts) return
+      const merged = mergeBounds(plan, pts)
+      if (!merged) return
+      const padX = (merged[1][0] - merged[0][0]) * 0.05
+      const padY = (merged[1][1] - merged[0][1]) * 0.05
+      bounds = {
+        minX: merged[0][0] - padX, maxX: merged[1][0] + padX,
+        minY: merged[0][1] - padY, maxY: merged[1][1] + padY,
       }
-      for (const f of routes?.features ?? []) eat(f.geometry.coordinates)
-      if (!Number.isFinite(minX)) return null
-      const padX = (maxX - minX) * 0.05, padY = (maxY - minY) * 0.05
-      return { minX: minX - padX, maxX: maxX + padX, minY: minY - padY, maxY: maxY + padY }
-    })()
-
-    // live без плана (serve без --plan): рамка по первым точкам машин,
-    // иначе все точки лепятся в центр холста и карта выглядит пустой
-    const fitByVehicles = () => {
-      if (bounds || routes) return
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-      for (const v of store.vehicles.values()) {
-        minX = Math.min(minX, v.lon); maxX = Math.max(maxX, v.lon)
-        minY = Math.min(minY, v.lat); maxY = Math.max(maxY, v.lat)
-      }
-      if (!Number.isFinite(minX)) return
-      const eps = 0.002
-      bounds = { minX: minX - eps, maxX: maxX + eps, minY: minY - eps, maxY: maxY + eps }
     }
 
     const project = (lon: number, lat: number): [number, number] => {
@@ -83,9 +72,10 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
     }
 
     const draw = () => {
-      fitByVehicles()
+      ensureBounds()
       ctx.fillStyle = '#101418'
       ctx.fillRect(0, 0, w, h)
+      if (bounds) drawGrid(ctx, bounds, project, w, h)
       for (const f of routes?.features ?? []) {
         const [x0, y0] = project(...firstCoord(f.geometry.coordinates))
         if (f.properties.kind === 'route') {
@@ -165,4 +155,47 @@ function firstCoord(c: unknown): [number, number] {
     return firstCoord(c[0])
   }
   return [0, 0]
+}
+
+type Bounds = { minX: number; minY: number; maxX: number; maxY: number }
+type Project = (lon: number, lat: number) => [number, number]
+
+/**
+ * Сетка координат с подписями — офлайн-аналог подложки. В canvas подписи
+ * бесплатны (у maplibre для текста нужен сетевой glyphs-сервер), поэтому
+ * фолбэк даёт даже больше контекста, чем основная карта.
+ */
+function drawGrid(
+  ctx: CanvasRenderingContext2D,
+  b: Bounds,
+  project: Project,
+  w: number,
+  h: number,
+) {
+  const midLat = (b.minY + b.maxY) / 2
+  const span = Math.max(b.maxX - b.minX, (b.maxY - b.minY) * Math.cos((midLat * Math.PI) / 180))
+  const step = niceStep(span)
+  const digits = step < 0.01 ? 3 : step < 0.1 ? 2 : step < 1 ? 1 : 0
+  const grid = graticuleFC([[b.minX, b.minY], [b.maxX, b.maxY]], step)
+  ctx.strokeStyle = '#1b242c'
+  ctx.lineWidth = 1
+  ctx.beginPath()
+  for (const f of grid.features) {
+    const c = f.geometry.coordinates as [number, number][]
+    c.forEach(([lon, lat], i) => {
+      const [x, y] = project(lon, lat)
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
+    })
+  }
+  ctx.stroke()
+  ctx.fillStyle = '#3c4a55'
+  ctx.font = '10px ui-monospace, monospace'
+  for (const f of grid.features) {
+    const c = f.geometry.coordinates as [number, number][]
+    const vertical = c[0][0] === c[1][0]
+    const [x, y] = project(...c[0])
+    const label = (vertical ? c[0][0] : c[0][1]).toFixed(digits) + '°'
+    if (x < 0 || x > w || y < 0 || y > h) continue
+    ctx.fillText(label, vertical ? x + 3 : 4, vertical ? 11 : y - 3)
+  }
 }

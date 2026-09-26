@@ -383,10 +383,10 @@ func (s *Server) knownUnits() []uint32 {
 			add(unit)
 		}
 	}
-	if s.cfg.Schedule != nil {
-		for _, tr := range s.cfg.Schedule.Vehicles() {
-			if s.cfg.Binding != nil {
-				if unit, ok := s.cfg.Binding.UnitID(tr); ok {
+	if sched := currentSchedule(s.cfg); sched != nil {
+		if b := currentBinding(s.cfg); b != nil {
+			for _, tr := range sched.Vehicles() {
+				if unit, ok := b.UnitID(tr); ok {
 					add(unit)
 				}
 			}

@@ -35,10 +35,19 @@ interface WirePrediction {
   sample_id?: string
   target_stop_id?: number
   horizon_s?: number
+  // cur_dev_s — измеренное отклонение «сейчас». null, когда конвейер не
+  // измерял его (кадр без фактов прошлых остановок): это отсутствие замера,
+  // а не «опоздания нет».
+  cur_dev_s?: number | null
   delta_s?: number
   predicted_dev_s?: number
-  p_late?: number
+  // p_late приходит null, когда вероятность не оценивалась (baseline, модель
+  // без P(late)-головы). Тип обязан это отражать, иначе `?? 0` ниже снова
+  // превратит «не оценивали» в «опоздания не будет».
+  p_late?: number | null
   source?: string
+  reason?: string
+  missing_features?: string[]
   stale?: boolean
   model_version?: string
   risk?: string
@@ -93,7 +102,7 @@ export interface WireDecodeResult {
   events: StreamEvent[]
   /** инциденты, которые gateway уже считает подтверждёнными */
   acked: string[]
-  /** инциденты, закрытые на gateway (панель их не убирает — см. docs) */
+  /** инциденты, закрытые на gateway (Store убирает их из рельса) */
   resolved: string[]
 }
 
@@ -214,21 +223,34 @@ export class WireAdapter {
       horizon_s: p.horizon_s ?? 0,
       // ambiguous на проводе не сериализуется; кадр live — не ничья
       ambiguous: false,
-      // подсказки организаторов в онлайне нет — риска это не ломает:
-      // классификация gateway идёт полем risk (см. src/risk.ts)
-      cur_dev_s: null,
+      // отклонение «сейчас» приходит с gateway измеренным: конвейер считает
+      // его по факту состоявшихся остановок, это не подсказка организатора
+      // и не прогноз. null — когда фактов не было, и тогда в values ключа
+      // нет вовсе, а не ноль
+      cur_dev_s: p.cur_dev_s ?? null,
       official: false,
       values: {
         predicted_dev_s: p.predicted_dev_s ?? 0,
         delta_s: p.delta_s ?? 0,
-        p_late: p.p_late ?? 0,
+        ...(p.cur_dev_s != null ? { cur_dev_s: p.cur_dev_s } : {}),
+        // ключ не добавляется вовсе, если вероятности нет: в values должен
+        // лежать реальный признак, а не ноль вместо отсутствия
+        ...(p.p_late != null ? { p_late: p.p_late } : {}),
         horizon_s: p.horizon_s ?? 0,
         speed_current: card.speed_kmh ?? 0,
         staleness_s: card.staleness_s ?? 0,
         points_in_window: card.points_in_window ?? 0,
       },
       risk: risk ?? undefined,
-      p_late: p.p_late,
+      // null с провода — это «вероятность не оценивалась», внутри это
+      // отсутствие ключа; различие живёт ровно на границе
+      p_late: p.p_late ?? undefined,
+      // источник, версия, причина и нехватка признаков — без них карточка
+      // ТС показывает только факт телеметрии, и прогноз не виден нигде
+      source: p.source,
+      model_version: p.model_version,
+      reason: p.reason,
+      missing: p.missing_features,
     }
     out.events.push(frame)
     this.modelFromPrediction(p, vts, out)
@@ -278,7 +300,13 @@ export class WireAdapter {
     const tr = inc.tr_id ?? 0
     if (!tr) return
     const delay = inc.predicted_dev_s ?? 0
-    const pLate = inc.p_late ?? 0
+    // p_late приходит только у модели с головой вероятностей. baseline его не
+    // заполняет никогда, и 0% в карточке читался бы как уверенный ответ
+    // «опоздания не будет» — вместо этого оставляем поле пустым, панель
+    // покажет «—».
+    const pLate = typeof inc.p_late === 'number' ? inc.p_late : undefined
+    const source = inc.source ?? '?'
+    const fallback = source === 'baseline'
     const event: IncidentEvent = {
       type: 'incident',
       ts: wireTime(inc.updated_at ?? inc.opened_at, ts),
@@ -295,13 +323,18 @@ export class WireAdapter {
       // контрактном смысле (подсказка точек) в онлайне отсутствует
       cur_dev_s: delay,
       // причину отдаёт ML-контур (правила §5.4, идут через gateway); её нет
-      // у fallback-прогнозов — тогда подставляем техническую строку, чтобы
-      // карточка не выглядела пустой, и вероятность видна была хотя бы в тексте
+      // у fallback-прогнозов. Для baseline объясняем, что означает число:
+      // модель не подключена и прогноз повторяет измеренное отставание —
+      // иначе карточка выглядит как настоящий прогноз с p_late 0.00
       reason: inc.reason ? String(inc.reason)
-        : `риск ${inc.risk ?? '?'}, прогноз ${Math.round(delay)} с, p_late ${pLate.toFixed(2)}`,
+        : fallback
+          ? 'модель не подключена — прогноз повторяет измеренное отставание'
+          : `риск ${inc.risk ?? '?'}, прогноз ${Math.round(delay)} с`
+            + (pLate != null ? `, p_late ${pLate.toFixed(2)}` : ''),
       p_late: pLate,
       prev_stop_id: typeof inc.prev_stop_id === 'number' && inc.prev_stop_id > 0 ? inc.prev_stop_id : undefined,
-      source: `gateway:${inc.source ?? '?'}`,
+      source: `gateway:${source}`,
+      resolved: inc.status === 'resolved',
     }
     out.events.push(event)
     if (inc.status === 'acked') out.acked.push(inc.id)

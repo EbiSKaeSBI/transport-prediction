@@ -7,6 +7,69 @@ import (
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
 )
 
+// predictionTo — predictionAt с явной целью: инцидент живёт на паре
+// (машина, остановка), и смена цели — отдельный случай жизненного цикла.
+func predictionTo(unit uint32, target int64, dev, plate float64) predictor.Prediction {
+	p := predictionAt(unit, dev, plate)
+	p.TargetStopID = target
+	return p
+}
+
+// Вытеснение архива не должно оставлять машину с инцидентом, которого уже
+// нет. Ёмкость 1: после второго красного прогноза первый инцидент вытесняется
+// (открытый вытеснять нельзя только когда есть что вытеснить вместо него, а
+// тут вытеснять нечем), и если бы он остался в индексе по машинам, смена цели
+// этой машины закрыла бы уже несуществующую запись.
+func TestEvictionClearsUnitIndex(t *testing.T) {
+	s := NewIncidents(1)
+	s.now = func() time.Time { return base }
+
+	first := s.Update(predictionTo(4242, 114, 200, 0.9))
+	if !first.Opened {
+		t.Fatal("первый красный прогноз должен открывать инцидент")
+	}
+	// Вторая машина вытесняет первый инцидент: закрытых пока нет, а ёмкость 1.
+	s.Update(predictionTo(7777, 114, 200, 0.9))
+
+	if _, err := s.Get(first.Incident.ID); err == nil {
+		t.Fatal("первый инцидент должен быть вытеснен")
+	}
+	// Смена цели вытесненной машины не имеет права публиковать Superseded:
+	// закрывать нечего, и в дашборде появилось бы закрытие отсутствующей карточки.
+	ev := s.Update(predictionTo(4242, 115, 210, 0.9))
+	if ev.Superseded != nil {
+		t.Errorf("вытесненный инцидент %q не должен закрываться повторно", ev.Superseded.ID)
+	}
+	if ev.Incident == nil || !ev.Opened {
+		t.Fatal("на новой цели красный прогноз должен открывать новый инцидент")
+	}
+}
+
+// Индекс по машинам нельзя чинить без сверки по ID. У машины есть закрытый
+// прошлый эпизод (114) и текущий (115); вытеснение архива удаляет закрытый,
+// и если бы оно снесло запись текущего, следующая смена цели не закрыла бы
+// ничего — поездка уехала бы, а тревога осталась бы висеть.
+func TestEvictionKeepsNewerIncidentOfSameUnit(t *testing.T) {
+	s := NewIncidents(2)
+	s.now = func() time.Time { return base }
+
+	old := s.Update(predictionTo(4242, 114, 200, 0.9))
+	cur := s.Update(predictionTo(4242, 115, 210, 0.9))
+	if cur.Incident == nil || cur.Incident.ID == old.Incident.ID {
+		t.Fatal("на новой цели ожидался новый инцидент")
+	}
+	// Третья машина вытеснит закрытый эпизод 114, но не текущий 115.
+	s.Update(predictionTo(7777, 114, 200, 0.9))
+
+	if _, err := s.Get(cur.Incident.ID); err != nil {
+		t.Errorf("текущий инцидент машины вытеснен: %v", err)
+	}
+	next := s.Update(predictionTo(4242, 116, 220, 0.9))
+	if next.Superseded == nil || next.Superseded.ID != cur.Incident.ID {
+		t.Fatalf("текущий инцидент не закрыт при смене цели: %+v", next.Superseded)
+	}
+}
+
 func TestRiskBoundaries(t *testing.T) {
 	// Границы проверяются точно, а не «где-то рядом»: сдвиг порога на
 	// секунду меняет, при каком прогнозе дежурный увидит тревогу, а это
@@ -98,6 +161,129 @@ func TestRepeatedRedUpdatesSameIncident(t *testing.T) {
 	// которой инцидент открылся.
 	if got := second.Incident.PredictedDevS; got != 260 {
 		t.Errorf("отклонение в карточке %g, ожидалось 260", got)
+	}
+}
+
+// Смена цели закрывает прежний инцидент. Машина уехала к следующей
+// остановке — прежняя тревога больше не про неё, и без закрытия одна
+// опоздывающая ТС оставляет в панели по карточке на каждую пройденную цель.
+func TestTargetAdvanceSupersedesPreviousIncident(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+
+	first := s.Update(predictionTo(4242, 114, 200, 0.9))
+	if !first.Opened {
+		t.Fatal("первый красный прогноз должен открывать инцидент")
+	}
+	second := s.Update(predictionTo(4242, 115, 210, 0.9))
+
+	if second.Superseded == nil {
+		t.Fatal("смена цели должна вернуть закрытый прежний инцидент")
+	}
+	if second.Superseded.ID != first.Incident.ID {
+		t.Errorf("закрыт %q, а не прежний %q", second.Superseded.ID, first.Incident.ID)
+	}
+	if second.Superseded.Status != StatusResolved {
+		t.Errorf("статус закрытого %q, ожидался %q", second.Superseded.Status, StatusResolved)
+	}
+	if second.Superseded.ResolvedAt == nil {
+		t.Error("у закрытого по смене цели нет ResolvedAt")
+	}
+	if second.Incident == nil || !second.Opened {
+		t.Fatal("на новой цели красный прогноз должен открывать новый инцидент")
+	}
+	if second.Incident.ID == first.Incident.ID {
+		t.Error("новая цель получила тот же идентификатор инцидента")
+	}
+	if st := s.Stats(); st.Open != 1 || st.Resolved != 1 {
+		t.Errorf("открыто %d, закрыто %d — ожидалось 1 и 1", st.Open, st.Resolved)
+	}
+	// Закрытый прежний инцидент остаётся в истории с теми цифрами, на которых
+	// его закрыли, и не превращается в обновляемый.
+	if list := s.List(StatusResolved, 0); len(list) != 1 || list[0].ID != first.Incident.ID {
+		t.Errorf("в resolved %v, ожидался только прежний %q", list, first.Incident.ID)
+	}
+}
+
+// Прежний инцидент закрывается сменой цели даже когда новая цель не красная:
+// иначе карточка висит до конца смены, хотя машина из зоны риска уехала.
+func TestTargetAdvanceSupersedesEvenWhenNewTargetIsGreen(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+
+	first := s.Update(predictionTo(4242, 114, 200, 0.9))
+	ev := s.Update(predictionTo(4242, 115, 10, 0.05))
+
+	if ev.Incident != nil {
+		t.Error("зелёный прогноз по новой цели не должен открывать инцидент")
+	}
+	if ev.Superseded == nil || ev.Superseded.ID != first.Incident.ID {
+		t.Fatalf("прежний инцидент не закрыт: %+v", ev.Superseded)
+	}
+	if st := s.Stats(); st.Open != 0 || st.Resolved != 1 {
+		t.Errorf("открыто %d, закрыто %d — ожидалось 0 и 1", st.Open, st.Resolved)
+	}
+}
+
+// Та же цель — тот же эпизод: смены цели не было, закрывать нечего.
+func TestSameTargetDoesNotSupersede(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+
+	first := s.Update(predictionTo(4242, 114, 200, 0.9))
+	again := s.Update(predictionTo(4242, 114, 260, 0.95))
+
+	if again.Superseded != nil {
+		t.Error("та же цель не должна закрывать инцидент")
+	}
+	if again.Incident.ID != first.Incident.ID || !again.Updated {
+		t.Error("тот же эпизод должен обновляться, а не переоткрываться")
+	}
+	if st := s.Stats(); st.Open != 1 || st.Resolved != 0 {
+		t.Errorf("открыто %d, закрыто %d — ожидалось 1 и 0", st.Open, st.Resolved)
+	}
+}
+
+// Чужая машина не должна закрываться: смена цели у одной ТС не трогает
+// тревогу по другой.
+func TestTargetAdvanceDoesNotTouchOtherVehicles(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+
+	other := s.Update(predictionTo(7777, 114, 200, 0.9))
+	s.Update(predictionTo(4242, 114, 200, 0.9))
+	ev := s.Update(predictionTo(4242, 115, 200, 0.9))
+
+	if ev.Superseded != nil && ev.Superseded.ID == other.Incident.ID {
+		t.Error("закрыт инцидент чужой машины")
+	}
+	got, err := s.Get(other.Incident.ID)
+	if err != nil {
+		t.Fatalf("инцидент чужой машины пропал: %v", err)
+	}
+	if got.Status != StatusOpen {
+		t.Errorf("инцидент чужой машины %q, ожидался %q", got.Status, StatusOpen)
+	}
+}
+
+// Взятый оператором инцидент сменой цели тоже закрывается: он про
+// конкретную остановку, а не про машину в целом.
+func TestAckedIncidentIsSupersededOnTargetAdvance(t *testing.T) {
+	s := NewIncidents(0)
+	s.now = func() time.Time { return base }
+
+	first := s.Update(predictionTo(4242, 114, 200, 0.9))
+	if _, err := s.Ack(first.Incident.ID, "оператор 1"); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	ev := s.Update(predictionTo(4242, 115, 200, 0.9))
+
+	if ev.Superseded == nil || ev.Superseded.Status != StatusResolved {
+		t.Fatalf("подтверждённый инцидент не закрыт: %+v", ev.Superseded)
+	}
+	if ev.Superseded.AckedBy != "оператор 1" {
+		t.Errorf("кто подтвердил %q — после закрытия это должно остаться в истории",
+			ev.Superseded.AckedBy)
 	}
 }
 

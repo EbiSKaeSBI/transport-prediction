@@ -30,6 +30,7 @@ main { display: flex; flex: 1; min-height: 0; }
   border-top: 1px solid #1d242c; background: #0e1216;
 }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+.legend-hint { color: #6c7a88; }
 
 aside {
   width: 360px; flex-shrink: 0; overflow-y: auto;
@@ -57,6 +58,17 @@ table.kv { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 table.kv td { padding: 2px 4px; border-bottom: 1px solid #151c23; vertical-align: top; }
 table.kv td:first-child { color: #7d8a97; width: 55%; }
 table.kv td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Список ТС: строки кликабельны (выбор машины для карточки), поэтому курсор и
+   подсветка выбранной строки — обязательны, иначе список выглядит таблицей,
+   а работает как меню. Числовые колонки выровнены вправо, как в .kv. */
+table.kv tr.list-row { cursor: pointer; }
+table.kv tr.list-row:hover td { background: #131b22; }
+table.kv tr.row-selected td { background: #16222c; color: #dbe2e8; }
+table.kv tr.list-row td { width: auto; color: #dbe2e8; text-align: right; }
+table.kv tr.list-row td:first-child { width: auto; text-align: left; color: #dbe2e8; }
+table.kv .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+.hint { color: #66727e; font-size: 11px; margin-top: 6px; }
 
 .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px; }
 .metrics-grid div { background: #0d1318; border-radius: 6px; padding: 6px 8px; display: flex; flex-direction: column; }

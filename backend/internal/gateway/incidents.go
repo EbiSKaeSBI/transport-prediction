@@ -104,7 +104,10 @@ type Incident struct {
 	ResolvedAt *time.Time `json:"resolved_at"`
 	// PredictedDevS, PLate — значения, давшие красную зону.
 	PredictedDevS float64 `json:"predicted_dev_s"`
-	PLate         float64 `json:"p_late"`
+	// PLate — указатель по той же причине, что в predictionView: у инцидента
+	// может не быть вероятности (baseline), и 0% здесь означал бы
+	// «опоздания не будет» вместо «вероятность не оценивалась».
+	PLate *float64 `json:"p_late"`
 	// Reason — предполагаемая причина (правила §5.4 на ML-стороне). Пустая,
 	// если прогноз пришёл из baseline/fallback: объяснять нечем.
 	Reason string `json:"reason,omitempty"`
@@ -136,6 +139,14 @@ type Incidents struct {
 	// никогда не находит существующий инцидент и каждый прогноз в красной
 	// зоне создаёт новый вместо обновления старого.
 	byKey map[string]*Incident
+	// byUnit — текущий незакрытый инцидент каждой машины. Инцидент живёт на
+	// конкретную остановку, а прогноз смотрит вперёд: когда цель уехала на
+	// следующую, прежний инцидент безнадзорно висит открытым, пока машина
+	// снова не выйдет из красной зоны по той же цели. Одна вечно опаздывающая
+	// ТС тогда оставляет в рельсе по карточке на каждую пройденную остановку,
+	// и оператор теряет среди них ту, что про текущую цель. Ключ по машине
+	// позволяет закрыть прежний эпизод в момент смены цели.
+	byUnit map[uint32]*Incident
 	// order — идентификаторы в порядке открытия. По нему и считаются
 	// свежие, и вытесняется самый старый.
 	order []string
@@ -158,10 +169,11 @@ func NewIncidents(capacity int) *Incidents {
 		capacity = DefaultIncidentCap
 	}
 	return &Incidents{
-		byID:  make(map[string]*Incident, capacity),
-		byKey: make(map[string]*Incident, capacity),
-		cap:   capacity,
-		now:   time.Now,
+		byID:   make(map[string]*Incident, capacity),
+		byKey:  make(map[string]*Incident, capacity),
+		byUnit: make(map[uint32]*Incident),
+		cap:    capacity,
+		now:    time.Now,
 	}
 }
 
@@ -205,6 +217,11 @@ type IncidentEvent struct {
 	// Resolved — инцидент только что закрыт, потому что риск ушёл из
 	// красной зоны.
 	Resolved bool
+	// Superseded — инцидент прежней цели той же машины, закрытый из-за
+	// перехода прогноза на следующую остановку. Отдельное поле, а не флаг в
+	// Incident: за один прогноз меняются два инцидента, и подписчик ленты
+	// должен получить оба, иначе закрытый навсегда останется висеть в панели.
+	Superseded *Incident
 }
 
 // Update приводит хранилище в соответствие с прогнозом и возвращает
@@ -222,6 +239,12 @@ func (s *Incidents) Update(p predictor.Prediction) IncidentEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Прежняя цель той же машины. Смена цели — это и есть «простой закончился,
+	// поездка пошла к следующей остановке»: прежний инцидент закрывается
+	// сам, без причины в самом инциденте, потому что машина уехала. Раньше он
+	// ждал выхода из красной зоны по своей цели, а её больше не существует.
+	suppressed := s.supersedeLocked(p.UnitID, id, now)
+
 	inc, ok := s.byKey[id]
 	if ok && inc.Status == StatusResolved {
 		// Машина снова в красной зоне после закрытия. Это новый эпизод:
@@ -236,7 +259,7 @@ func (s *Incidents) Update(p predictor.Prediction) IncidentEvent {
 		// Эпизод идёт: цифры обновляются под текущим прогнозом, иначе в
 		// карточке осталась бы та оценка, на которой инцидент открылся.
 		inc.PredictedDevS = p.PredictedDevS
-		inc.PLate = p.PLate
+		inc.PLate = plateOrNil(p)
 		// Причина перезаписывается только когда её принесли: пустая строка
 		// от fallback не должна стирать последнее известное объяснение —
 		// инцидент в этот момент всё ещё красные секунды, и оператору
@@ -255,15 +278,21 @@ func (s *Incidents) Update(p predictor.Prediction) IncidentEvent {
 			inc.Status = StatusResolved
 			resolved := now
 			inc.ResolvedAt = &resolved
-			return IncidentEvent{Incident: copyOf(inc), Resolved: true}
+			if cur, ok := s.byUnit[p.UnitID]; ok && cur.ID == inc.ID {
+				delete(s.byUnit, p.UnitID)
+			}
+			return IncidentEvent{Incident: copyOf(inc), Resolved: true, Superseded: suppressed}
 		}
-		return IncidentEvent{Incident: copyOf(inc), Updated: true}
+		s.byUnit[p.UnitID] = inc
+		return IncidentEvent{Incident: copyOf(inc), Updated: true, Superseded: suppressed}
 	}
 
 	if risk != RiskRed {
 		// Жёлтая зона инцидента не создаёт: она существует затем, чтобы
 		// оператор увидел тревожный прогноз до того, как он стал простоям.
-		return IncidentEvent{}
+		// Прежняя цель при этом закрывается — иначе её карточка осталась бы
+		// висеть до конца смены.
+		return IncidentEvent{Superseded: suppressed}
 	}
 
 	s.seq++
@@ -278,19 +307,47 @@ func (s *Incidents) Update(p predictor.Prediction) IncidentEvent {
 		OpenedAt:      now,
 		UpdatedAt:     now,
 		PredictedDevS: p.PredictedDevS,
-		PLate:         p.PLate,
+		PLate:         plateOrNil(p),
 		Reason:        p.Reason,
 		Stale:         p.Stale,
 		Source:        p.Source,
 	}
 	s.byID[inc.ID] = inc
 	s.byKey[IncidentID(inc.UnitID, inc.TargetStopID)] = inc
+	s.byUnit[inc.UnitID] = inc
 	s.order = append(s.order, inc.ID)
 	s.evictLocked()
 	// Копия, а не сам указатель: инцидент живёт в хранилище и следующий
 	// прогноз перепишет его поля, пока вызывающий смотрит в этот ответ.
 	// Get и List тоже отдают копии, и Update не должен быть исключением.
-	return IncidentEvent{Incident: copyOf(inc), Opened: true}
+	return IncidentEvent{Incident: copyOf(inc), Opened: true, Superseded: suppressed}
+}
+
+// supersedeLocked закрывает текущий инцидент машины, если он держится на
+// другую цель, чем текущий прогноз. Возвращает копию закрытого (nil, если
+// закрывать нечего), чтобы вызывающий отдал его подписчикам.
+//
+// Закрытие здесь не выдумывает для инцидента новой причины: уехавшая машина
+// — это разрешение ситуации, а не отмена тревоги, и ResolvedAt остаётся
+// временем, когда машина реально уехала.
+func (s *Incidents) supersedeLocked(unitID uint32, currentKey string, now time.Time) *Incident {
+	cur, ok := s.byUnit[unitID]
+	if !ok {
+		return nil
+	}
+	if IncidentID(cur.UnitID, cur.TargetStopID) == currentKey {
+		return nil
+	}
+	delete(s.byUnit, unitID)
+	if cur.Status == StatusResolved {
+		return nil
+	}
+	cur.Status = StatusResolved
+	resolved := now
+	cur.ResolvedAt = &resolved
+	cur.UpdatedAt = now
+	delete(s.byKey, IncidentID(cur.UnitID, cur.TargetStopID))
+	return copyOf(cur)
 }
 
 // copyOf возвращает копию инцидента. Копия нужна во всех ответах наружу:
@@ -462,9 +519,14 @@ func (s *Incidents) evictLocked() {
 	}
 }
 
-// removeLocked убирает инцидент из обеих карт. Убрать только из byID нельзя:
-// в byKey осталась бы ссылка на удалённый инцидент, и следующий прогноз
-// обновил бы то, чего уже нет.
+// removeLocked убирает инцидент из всех трёх карт. Убрать только из byID
+// нельзя: в byKey осталась бы ссылка на удалённый инцидент, и следующий
+// прогноз обновил бы то, чего уже нет. byUnit тоже обязателен — иначе
+// вытесненный (уже удалённый из byID) инцидент остался бы текущим для
+// машины, и следующая смена цели опубликовала бы Superseded для несуществующей
+// записи: в дашборде появилось бы закрытие инцидента, которого там нет, а
+// Ack по нему отвечал бы 404. Сверка по ID обязательна и здесь: на одну машину
+// в byUnit может висеть уже более новый инцидент, и его трогать нельзя.
 func (s *Incidents) removeLocked(id string) {
 	inc, ok := s.byID[id]
 	if !ok {
@@ -474,6 +536,9 @@ func (s *Incidents) removeLocked(id string) {
 	key := IncidentID(inc.UnitID, inc.TargetStopID)
 	if cur, ok := s.byKey[key]; ok && cur.ID == inc.ID {
 		delete(s.byKey, key)
+	}
+	if cur, ok := s.byUnit[inc.UnitID]; ok && cur.ID == inc.ID {
+		delete(s.byUnit, inc.UnitID)
 	}
 }
 
