@@ -55,7 +55,15 @@ export class Store {
       case 'incident': {
         // at-least-once доставка (live WS): повтор того же id не должен
         // сбрасывать ack уже показанного инцидента
-        if (!this.incidents.has(ev.id)) this.incidents.set(ev.id, { ...ev, acked: false })
+        const exist = this.incidents.get(ev.id)
+        if (!exist) {
+          this.incidents.set(ev.id, { ...ev, acked: false })
+        } else if (!exist.horizon_s && ev.horizon_s) {
+          // live: снимок инцидентов при подключении приходит раньше карточек
+          // машин, и горизонт узнаётся только из последующего прогноза —
+          // дописываем ровно это поле, ack и остальное не трогаем
+          this.incidents.set(ev.id, { ...exist, horizon_s: ev.horizon_s })
+        }
         break
       }
       case 'model': { this.model = ev as ModelEvent; break }

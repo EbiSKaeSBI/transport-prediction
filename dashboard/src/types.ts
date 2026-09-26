@@ -24,6 +24,14 @@ export interface FrameEvent {
   cur_dev_s: number | null
   official: boolean
   values: Record<string, number>
+  /**
+   * Классификация риска от gateway (wire-событие vehicle_update, этап 5):
+   * учтена и предсказанная задержка, и p_late. В replay-потоке поля нет —
+   * риск остаётся на правиле-фолбэке cur_dev_s (ADR 0003).
+   */
+  risk?: Risk
+  /** Вероятность опоздания от модели; приходит только live-лентой. */
+  p_late?: number
 }
 
 export interface IncidentEvent {

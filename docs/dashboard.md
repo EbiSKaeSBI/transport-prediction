@@ -56,7 +56,79 @@ npm ci && npm run dev     # http://localhost:5173
 | Режим | Как включить | Что делает |
 |---|---|---|
 | demo-реплей | по умолчанию | проигрывает `/demo/stream.ndjson` с ускорением ×1…×300, пауза; часы потока двигают stale-детекцию |
-| live WS | `?ws=ws://<host>:8080/ws/stream` | WebSocket с реконнектом (экспоненциальный backoff, §4.7); ack шлёт `POST /api/v1/incidents/{id}/ack` |
+| live WS | `?ws=ws://<host>:8080/ws/stream` (в dev — и `ws://localhost:5173/ws/stream` через vite-прокси) | WebSocket с реконнектом (экспоненциальный backoff 0.5→30 с, §4.7); ack шлёт `POST /api/v1/incidents/{id}/ack` |
+
+## Live-адаптер: wire gateway → контракт потока
+
+Gateway (`backend/internal/gateway/hub.go`, этап 4) пишет в `/ws/stream`
+конверты `{type, at, data}` со СВОИМИ типами событий, а не NDJSON контракта.
+Переписывать gateway под контракт нельзя (стабилен, покрыт Go-тестами, а
+replay-файл демо уже в целевом формате), поэтому перевод делает клиент —
+`src/wire.ts::WireAdapter`, подключён в `WsSource`.
+
+| Wire `type` | `data` | Что порождает |
+|---|---|---|
+| `vehicle_update` | карточка машины (`vehicleView`) — одна или `{vehicles:[...]}` (снимок при подключении) | `vehicle` (lon/lat/speed/heading, ts = `last_seen`) + `frame` (sample_id, target_stop_id, horizon_s, values из карточки; ts = `prediction.as_of`) + однократное `model` при смене версии/источника прогноза |
+| `incident` | `{incident}` / `{incidents, stats}` (снимок) | `incident` (ts = `updated_at`, `predicted_delay_s = predicted_dev_s`, `source = gateway:<источник прогноза>`); `status: acked` → подтверждение в Store, `resolved` → без события (Store не умеет закрывать, карточка живёт до ack — как в replay) |
+| `metrics` | срез `Gateway.Snapshot()` — массив тех же конвертов | рекурсивный прогон каждого внутреннего события (позиции и открытые инциденты обновляются каждые 5 с) |
+| неизвестный тип / битый JSON | — | тихо игнорируется, соединение живо |
+
+Поля, которых физически нет на проводе, не выдумываются: `cur_dev_s` у
+live-кадра = null (подсказка организаторов существует только в офлайне),
+`values` несёт только то, что пришло в карточке (predicted_dev_s, delta_s,
+p_late, скорость, staleness, points_in_window), `meta` в live не приходит
+(панели это не блокирует), горизонт инцидента подтягивается из последнего
+прогноза той же машины (в ленте карточка машины идёт раньше инцидента —
+порядок `Observe`), до него — 0.
+
+Цвета на карте: gateway шлёт готовую классификацию `risk` (учитывает и
+`predicted_dev_s ≥ 60/120`, и `p_late ≥ 0.3/0.6`,
+`backend/internal/gateway/incidents.go`), `src/risk.ts` приоритетно берёт её
+из live-кадра; replay-кадры поля `risk` не несут и остаются на правиле-
+фолбэке ADR 0003. Интерфейс `vehicleRisk(v, clock)` не менялся.
+
+Время: `at` — `time.Time` из Go, RFC3339 с настоящим смещением зоны
+(«+03:00» или «Z» только когда процесс живёт в UTC). `Date.parse` даёт
+истинный unix epoch — та же ось, на которой replay-генератор читает naive
+ wall-clock МСК через `tzinfo=MSK` (`scripts/make_dashboard_demo.py`,
+ADR 0004). Ручных сдвигов в адаптере нет; «Go дописывает Z к наивному
+времени» на ленте не случается — там сериализуется объект времени, а не
+строка. Проверка оси — в `scripts/adapter.test.mjs` (тесты «Z-строка» и
+«edge»).
+
+Stale-детекция: `ts` точки = `last_seen`, а это время ПРИЁМА пакета
+накопителем (живые стенные часы gateway), поэтому серые/голубые машины в
+live ведут себя как в реплее: машина без телеметрии стареет через 180 с
+после последнего пакета.
+
+### Живая проверка без эмулятора
+
+`scripts/ndtp_feed.py` (stdlib python) поднимает настоящий NDTP-поток на
+`transportctl serve`: переиспользует байты golden-потока
+`backend/internal/ndtp/testdata/golden/packets.bin`, меняя только метку
+Nav00 на текущую (CRC-16/Modbus со свапом пересчитывается, handshake
+CONN_REQUEST несёт unit_id в PeerAddress), и пишет синтетический план
+`--plan-out/--binding-out` (прошедшие остановки с фактом +150 с →
+cur_dev_s ≥ 120 → красный риск и инциденты на живых данных):
+
+```bash
+python3 scripts/ndtp_feed.py --plan-out /tmp/live_plan.csv \
+    --binding-out /tmp/live_binding.csv --generate-only
+(cd ml && .venv/bin/python -m predictor.serve --model artifacts/model_v1v3b.json --port 8010) &
+(cd backend && go run ./cmd/transportctl serve --listen :9211 \
+    --plan /tmp/live_plan.csv --binding /tmp/live_binding.csv \
+    --http :8080 --ml http://127.0.0.1:8010 --grid 5s --tick 2s) &
+python3 scripts/ndtp_feed.py --port 9211 --every 1 &
+cd dashboard && node scripts/build-adapter.mjs && node scripts/ws-smoke.mjs \
+    ws://127.0.0.1:8080/ws/stream --duration 40          # позиции, риск, инциденты, метрики
+node --test scripts/adapter.test.mjs                     # unit-адаптера + store/risk
+```
+
+`ws-smoke.mjs` исполняет БОЕВОЙ `WsSource` (он не трогает window/document) —
+убийство gateway посреди прогона видно в логе как `retry` с backoff и
+повторный `open` со снимком. Тестового раннера в проекте нет; node:test из
+stdlib и этот прогон — доказательство, отдельный jest/vitest ради задачи не
+заводился.
 
 ## Риск и инциденты до подключения ML
 

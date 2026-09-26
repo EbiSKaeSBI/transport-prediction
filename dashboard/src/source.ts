@@ -1,5 +1,6 @@
 import type { StreamEvent } from './types'
 import { Store } from './store'
+import { WireAdapter } from './wire'
 
 export interface DataSource {
   start(): Promise<void>
@@ -110,21 +111,33 @@ export class ReplaySource implements DataSource {
 }
 
 /**
- * WsSource — живой поток gateway (этап 4): сообщения NDJSON по /ws/stream.
- * Реконнект с экспоненциальным backoff, как и положено по §4.7.
+ * WsSource — живой поток gateway (этап 4/5): JSON-конверты
+ * {type: vehicle_update|incident|metrics, at, data} по /ws/stream.
+ * WireAdapter переводит их в события контракта — Store и панели не знают
+ * о различии форматов. Реконнект с экспонениальным backoff, как положено
+ * по §4.7. Класс не трогает window/document: тот же код исполняется в
+ * браузере и в node-проверке (dashboard/scripts/ws-smoke.mjs).
  */
 export class WsSource implements DataSource {
   readonly mode = 'ws'
-  private ws: WebSocket | null = null
+  private ws: WsLike | null = null
   private closed = false
   private retry = 0
+  private timer: ReturnType<typeof setTimeout> | null = null
 
   private store: Store
   private url: string
+  private wire = new WireAdapter()
+  private status: (s: 'open' | 'closed' | 'retry', detail?: string) => void
 
-  constructor(store: Store, url: string) {
+  constructor(
+    store: Store,
+    url: string,
+    onStatus: (s: 'open' | 'closed' | 'retry', detail?: string) => void = () => {},
+  ) {
     this.store = store
     this.url = url
+    this.status = onStatus
   }
 
   async start(): Promise<void> {
@@ -134,31 +147,53 @@ export class WsSource implements DataSource {
 
   stop(): void {
     this.closed = true
+    if (this.timer != null) clearTimeout(this.timer)
+    this.timer = null
     this.ws?.close()
     this.ws = null
   }
 
   private open(): void {
     if (this.closed) return
-    this.ws = new WebSocket(this.url)
-    this.ws.onopen = () => { this.retry = 0 }
-    this.ws.onmessage = (msg: MessageEvent<string>) => {
-      for (const line of String(msg.data).split('\n')) {
-        const s = line.trim()
-        if (!s) continue
-        try {
-          this.store.apply(JSON.parse(s) as StreamEvent)
-        } catch {
-          // сообщение не нашего контракта — игнорируем, поток жив
-        }
-      }
+    const Ctor = globalThis.WebSocket
+    if (!Ctor) {
+      this.status('closed', 'нет WebSocket в окружении')
+      return
     }
-    this.ws.onclose = () => {
+    const ws = new Ctor(this.url) as unknown as WsLike
+    this.ws = ws
+    ws.onopen = () => {
+      this.retry = 0
+      this.status('open')
+    }
+    ws.onmessage = (msg) => {
+      const { events, acked } = this.wire.decodeMessage(String(msg.data))
+      for (const ev of events) this.store.apply(ev)
+      // gateway уже подтверждённый инцидент: ack без сброса локального состояния
+      // (Store.apply повторный id игнорирует, ack идемпотентен)
+      for (const id of acked) this.store.ack(id)
+    }
+    ws.onerror = () => {
+      // перед onclose: подробности ошибки в браузере не отдаются, журнал — в статусе
+    }
+    ws.onclose = (ev?: { code?: number; reason?: string }) => {
       if (this.closed) return
       const delay = Math.min(30000, 500 * 2 ** this.retry++)
-      window.setTimeout(() => this.open(), delay)
+      this.status('retry', `через ${delay} мс (попытка ${this.retry + 1}, код ${ev?.code ?? '?'})`)
+      this.timer = setTimeout(() => { this.timer = null; this.open() }, delay)
     }
   }
+}
+
+// Минимальный контракт WebSocket-объекта: браузерный и node-ный (undici)
+// WebSocket подходят, типами обязывает сам окружение, здесь — только поле
+// обработчиков, которые использует класс.
+interface WsLike {
+  onopen: (() => void) | null
+  onmessage: ((msg: { data: unknown }) => void) | null
+  onerror: (() => void) | null
+  onclose: ((ev?: { code?: number; reason?: string }) => void) | null
+  close(): void
 }
 
 export async function detectSource(store: Store): Promise<DataSource> {
