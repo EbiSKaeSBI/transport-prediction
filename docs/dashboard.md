@@ -1,0 +1,165 @@
+# Диспетчерский дашборд (критерий 4)
+
+Двухколоночный UI: слева карта риска, справа колонка панелей (инциденты,
+карточка выбранного ТС, метрики потока, модель). Пакеты: React 19 +
+TypeScript, MapLibre GL, ECharts. Никаких внешних тайлов и CDN —
+вендоренный минимальный стиль, при отсутствии WebGL включается
+canvas-фолбэк (`src/CanvasMap.tsx`). Это выполняет требование
+«демо работает офлайн» (docs/architecture.md §6, риск §9.3).
+
+## Быстрый старт (demo-реплей)
+
+```bash
+# 1. кадры признаков считает Go-конвейер — тот же код, что в онлайне:
+cd backend
+go run ./cmd/transportctl features \
+  --plan ../validate/schedule_plan.csv --binding ../validate/traffic.csv \
+  --input ../validate/traffic.csv --tick 5m --frames \
+  --out ../dashboard/public/demo/frames.jsonl
+
+# 2. собрать поток (только stdlib Python):
+cd ..
+python3 scripts/make_dashboard_demo.py --every 60
+
+# 3. поднять UI:
+cd dashboard
+npm ci && npm run dev     # http://localhost:5173
+```
+
+Каталог `dashboard/public/demo/` генерируется и в git не попадает.
+
+`--every` — шаг прореживания телеметрии (сек); все события в потоке
+упорядочены по времени.
+
+## Контракт потока
+
+Один и тот же NDJSON приходит из файла реплея и по WebSocket от gateway —
+клиент источники не различает (`src/types.ts`).
+
+| Тип | Смысл | Ключевые поля |
+|---|---|---|
+| `meta` | параметры сессии | day, window, vehicles, frames, incidents, routes |
+| `vehicle` | точка телеметрии | ts, tr_id, lon, lat, speed, heading |
+| `frame` | прогнозный кадр Go-фичей | sample_id, tr_id, target_stop_id, horizon_s, ambiguous, cur_dev_s?, official, values{} |
+| `incident` | карточка инцидента | id, ts, tr_id, target_stop_id, horizon_s, predicted_delay_s, cur_dev_s, reason, source |
+| `model` | панель модели | version, model_version, trained_at, mae_validate_s, mae_test_s, note |
+
+`cur_dev_s` в `frame` — только подсказка организаторов из
+`validate/points.csv` (официальные точки); у остальных кадров его нет, и
+риск для таких ТС — голубой «прогноз не сформирован» (серый = нет свежей
+телеметрии). Ось времени потока — unix epoch стенных часов МСК; Go в поле
+`t` кадра дописывает «Z» к наивному времени без конвертации, генератор
+читает его в ту же ось (иначе подсказка уезжала бы на T−3ч).
+
+## Режимы источника
+
+| Режим | Как включить | Что делает |
+|---|---|---|
+| demo-реплей | по умолчанию | проигрывает `/demo/stream.ndjson` с ускорением ×1…×300, пауза; часы потока двигают stale-детекцию |
+| live WS | `?ws=ws://<host>:8080/ws/stream` (в dev — и `ws://localhost:5173/ws/stream` через vite-прокси) | WebSocket с реконнектом (экспоненциальный backoff 0.5→30 с, §4.7); ack шлёт `POST /api/v1/incidents/{id}/ack` |
+
+## Live-адаптер: wire gateway → контракт потока
+
+Gateway (`backend/internal/gateway/hub.go`, этап 4) пишет в `/ws/stream`
+конверты `{type, at, data}` со СВОИМИ типами событий, а не NDJSON контракта.
+Переписывать gateway под контракт нельзя (стабилен, покрыт Go-тестами, а
+replay-файл демо уже в целевом формате), поэтому перевод делает клиент —
+`src/wire.ts::WireAdapter`, подключён в `WsSource`.
+
+| Wire `type` | `data` | Что порождает |
+|---|---|---|
+| `vehicle_update` | карточка машины (`vehicleView`) — одна или `{vehicles:[...]}` (снимок при подключении) | `vehicle` (lon/lat/speed/heading, ts = `last_seen`) + `frame` (sample_id, target_stop_id, horizon_s, values из карточки; ts = `prediction.as_of`) + однократное `model` при смене версии/источника прогноза |
+| `incident` | `{incident}` / `{incidents, stats}` (снимок) | `incident` (ts = `updated_at`, `predicted_delay_s = predicted_dev_s`, `source = gateway:<источник прогноза>`); `status: acked` → подтверждение в Store, `resolved` → без события (Store не умеет закрывать, карточка живёт до ack — как в replay) |
+| `metrics` | срез `Gateway.Snapshot()` — массив тех же конвертов | рекурсивный прогон каждого внутреннего события (позиции и открытые инциденты обновляются каждые 5 с) |
+| неизвестный тип / битый JSON | — | тихо игнорируется, соединение живо |
+
+Поля, которых физически нет на проводе, не выдумываются: `cur_dev_s` у
+live-кадра = null (подсказка организаторов существует только в офлайне),
+`values` несёт только то, что пришло в карточке (predicted_dev_s, delta_s,
+p_late, скорость, staleness, points_in_window), `meta` в live не приходит
+(панели это не блокирует), горизонт инцидента подтягивается из последнего
+прогноза той же машины (в ленте карточка машины идёт раньше инцидента —
+порядок `Observe`), до него — 0.
+
+Цвета на карте: gateway шлёт готовую классификацию `risk` (учитывает и
+`predicted_dev_s ≥ 60/120`, и `p_late ≥ 0.3/0.6`,
+`backend/internal/gateway/incidents.go`), `src/risk.ts` приоритетно берёт её
+из live-кадра; replay-кадры поля `risk` не несут и остаются на правиле-
+фолбэке ADR 0003. Интерфейс `vehicleRisk(v, clock)` не менялся.
+
+Время: `at` — `time.Time` из Go, RFC3339 с настоящим смещением зоны
+(«+03:00» или «Z» только когда процесс живёт в UTC). `Date.parse` даёт
+истинный unix epoch — та же ось, на которой replay-генератор читает naive
+ wall-clock МСК через `tzinfo=MSK` (`scripts/make_dashboard_demo.py`,
+ADR 0004). Ручных сдвигов в адаптере нет; «Go дописывает Z к наивному
+времени» на ленте не случается — там сериализуется объект времени, а не
+строка. Проверка оси — в `scripts/adapter.test.mjs` (тесты «Z-строка» и
+«edge»).
+
+Stale-детекция: `ts` точки = `last_seen`, а это время ПРИЁМА пакета
+накопителем (живые стенные часы gateway), поэтому серые/голубые машины в
+live ведут себя как в реплее: машина без телеметрии стареет через 180 с
+после последнего пакета.
+
+### Живая проверка без эмулятора
+
+`scripts/ndtp_feed.py` (stdlib python) поднимает настоящий NDTP-поток на
+`transportctl serve`: переиспользует байты golden-потока
+`backend/internal/ndtp/testdata/golden/packets.bin`, меняя только метку
+Nav00 на текущую (CRC-16/Modbus со свапом пересчитывается, handshake
+CONN_REQUEST несёт unit_id в PeerAddress), и пишет синтетический план
+`--plan-out/--binding-out` (прошедшие остановки с фактом +150 с →
+cur_dev_s ≥ 120 → красный риск и инциденты на живых данных):
+
+```bash
+python3 scripts/ndtp_feed.py --plan-out /tmp/live_plan.csv \
+    --binding-out /tmp/live_binding.csv --generate-only
+(cd ml && .venv/bin/python -m predictor.serve --model artifacts/model_v1v3b.json --port 8010) &
+(cd backend && go run ./cmd/transportctl serve --listen :9211 \
+    --plan /tmp/live_plan.csv --binding /tmp/live_binding.csv \
+    --http :8080 --ml http://127.0.0.1:8010 --grid 5s --tick 2s) &
+python3 scripts/ndtp_feed.py --port 9211 --every 1 &
+cd dashboard && node scripts/build-adapter.mjs && node scripts/ws-smoke.mjs \
+    ws://127.0.0.1:8080/ws/stream --duration 40          # позиции, риск, инциденты, метрики
+node --test scripts/adapter.test.mjs                     # unit-адаптера + store/risk
+```
+
+`ws-smoke.mjs` исполняет БОЕВОЙ `WsSource` (он не трогает window/document) —
+убийство gateway посреди прогона видно в логе как `retry` с backoff и
+повторный `open` со снимком. Тестового раннера в проекте нет; node:test из
+stdlib и этот прогон — доказательство, отдельный jest/vitest ради задачи не
+заводился.
+
+## Риск и инциденты до подключения ML
+
+Модель CatBoost (этап 3) ещё не обучена, поэтому прогноз считается
+задокументированным правилом-фолбэком (ADR 0003):
+`predicted = cur_dev_s`, порог инцидента 120 с (docs/architecture.md §4.1),
+горизонт ∈ (10; 15] мин. Цвета: зелёный &lt; 60 с, жёлтый 60–120 с (включая 60), красный
+≥ 120 с; серый — нет свежей телеметрии (> 180 с); голубой — кадр не
+сформирован. Когда gateway начнёт присылать `predicted_delay_s` и `p_late`
+от модели, функция риска в `src/risk.ts` переключается на них без
+изменения интерфейса.
+
+Причина инцидента (`reason`) — детерминированное правило по кадру фичей
+(простой/скорость/интервал), та же логика, что описана в how-it-works §2.9.
+
+## Панели
+
+- **Инциденты** — карточка: опоздание, ТС, остановка (адрес из плана),
+  время и горизонт, причина, источник прогноза, кнопка «Подтвердить».
+- **ТС** — по клику на точку: позиция, скорость, все контрактные признаки
+  последнего кадра (cur_dev, простой, скорость сегмента, дистанция,
+  оставшиеся остановки, дрейф, headway, slack, качество данных).
+- **Поток** — событий/с, активные/всего ТС, кадры, открытые инциденты,
+  гистограмма частоты. p50/p95/p99 инференса появятся с ML-сервисом —
+  это честно подписано в панели.
+- **Модель** — версия, MAE validate от оракула (88.72 с для v0-rule),
+  дата обучения.
+
+## Точность воспроизведения
+
+Все числа панели «Модель» и правила порога берутся из `docs/data-audit.md`
+и ADR; генератор потока не изобретает прогнозы — он прогоняет телеметрию
+через реальный Go-конвейер (`transportctl features`) и официальные точки
+`validate/points.csv`.

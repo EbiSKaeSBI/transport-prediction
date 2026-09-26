@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# esbuild/rolldown-бандл live-адаптера для node-проверок — собирается scripts/build-adapter.mjs
+scripts/adapter.bundle.mjs
+
+# Генерируется scripts/make_dashboard_demo.py — не коммитим
+public/demo/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

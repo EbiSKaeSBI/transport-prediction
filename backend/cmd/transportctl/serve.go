@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -87,7 +88,12 @@ func runServe(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	var jsonlFile *os.File
-	var output *os.File
+	// Тип — io.Writer, а не *os.File: nil в интерфейсе обязан быть
+	// настоящим nil. Иначе Observer получает ненулевой интерфейс с nil
+	// указателем внутри, его проверка out == nil не срабатывает, и на
+	// каждое наблюдение пишется WARN «invalid argument» (GitLab #36,
+	// замечание к этапу 6).
+	var output io.Writer
 	if *jsonl {
 		file, err := os.Create(*jsonlOut)
 		if err != nil {
