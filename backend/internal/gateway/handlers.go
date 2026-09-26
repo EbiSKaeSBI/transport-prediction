@@ -78,6 +78,19 @@ func (s *Server) readiness(w http.ResponseWriter, _ *http.Request) {
 	} else {
 		add("predictor", true, "")
 	}
+	if s.cfg.ML != nil {
+		// Расхождение контракта признаков делает каждый прогноз
+		// правдоподобно неверным — это неготовность, а не деградация.
+		st := s.cfg.ML.Stats()
+		switch {
+		case st.ContractErr != nil:
+			add("model", false, st.ContractErr.Error())
+		case st.Version != "":
+			add("model", true, "контракт совпал, модель "+st.Version)
+		default:
+			add("model", true, "обращений к модели ещё не было")
+		}
+	}
 	ready := true
 	for _, c := range checks {
 		if !c.OK {

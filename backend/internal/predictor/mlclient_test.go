@@ -17,8 +17,8 @@ import (
 // modelInfoBody — ответ /model/info с корректным набором признаков.
 func modelInfoBody() map[string]any {
 	return map[string]any{
-		"version":       "2026.09-test",
-		"feature_names": FeatureContract(),
+		"version":  "2026.09-test",
+		"features": FeatureContract(),
 	}
 }
 
@@ -48,6 +48,46 @@ func ptr[T any](v T) *T { return &v }
 // base — опорный момент, чтобы времена в тестах читались.
 var base = time.Date(2026, 1, 6, 8, 0, 0, 0, time.UTC)
 
+// TestPredictRequestIsFlatWire — wire-контракт §4.5: имена признаков ключами
+// верхнего уровня, а не вложенным «features» (FastAPI валидирует плоский
+// dict, extras и есть фичи). Фейки обеих сторон форму тела не проверяли,
+// поэтому вложенный запрос уходил на 422 молча: этот тест — единственная
+// защита формы запроса.
+func TestPredictRequestIsFlatWire(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/model/info":
+			_ = json.NewEncoder(w).Encode(modelInfoBody())
+		case "/predict":
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("тело не читается: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(predictResponse{
+				DelayS: ptr(5.0), PLate: ptr(0.1), ModelVersion: "v1",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewMLClient(MLConfig{BaseURL: srv.URL})
+	c.Predict(t.Context(), frameAt(t, base, 42))
+	if _, nested := got["features"]; nested {
+		t.Error("запрос вёз вложенный «features»: сервер ждёт плоский dict")
+	}
+	for _, name := range []string{"sample_id", "cur_dev_s", "horizon_s", "speed_current"} {
+		if _, ok := got[name]; !ok {
+			t.Errorf("нет ключа %q верхнего уровня", name)
+		}
+	}
+	if v, ok := got["cur_dev_s"].(float64); !ok || v != 42 {
+		t.Errorf("cur_dev_s = %v, хотим 42", got["cur_dev_s"])
+	}
+}
+
 func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 	var predicts atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,7 +97,7 @@ func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 		case "/predict":
 			predicts.Add(1)
 			_ = json.NewEncoder(w).Encode(predictResponse{
-				DeltaS: ptr(30.0), PLate: ptr(0.4), ModelVersion: "v1",
+				DelayS: ptr(90.0), PLate: ptr(0.4), ModelVersion: "v1",
 			})
 		default:
 			http.NotFound(w, r)
@@ -73,7 +113,7 @@ func TestMLClientChecksContractBeforePredicting(t *testing.T) {
 	if p.DeltaS != 30 {
 		t.Errorf("добавка %v, ожидалось 30", p.DeltaS)
 	}
-	// cur_dev_s = 60, добавка 30 — итоговое отклонение обязано быть 90.
+	// cur_dev_s = 60, сервис ответил delay_s=90 — добавка обязана выйти 30.
 	if p.PredictedDevS != 90 {
 		t.Errorf("отклонение %v, ожидалось 90", p.PredictedDevS)
 	}
@@ -96,15 +136,15 @@ func TestMismatchedContractRefusesToPredict(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/predict" {
 			predicts.Add(1)
-			_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(1.0), PLate: ptr(0.1)})
+			_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), PLate: ptr(0.1)})
 			return
 		}
 		names := FeatureContract()
 		// Модель забыла один признак и завела свой.
 		names = slices.DeleteFunc(names, func(n string) bool { return n == "headway_s" })
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"version":       "v1",
-			"feature_names": append(names, "brand_new_feature"),
+			"version":  "v1",
+			"features": append(names, "brand_new_feature"),
 		})
 	}))
 	defer srv.Close()
@@ -132,10 +172,10 @@ func TestContractIgnoresOrder(t *testing.T) {
 	slices.Reverse(names)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/model/info" {
-			_ = json.NewEncoder(w).Encode(map[string]any{"feature_names": names})
+			_ = json.NewEncoder(w).Encode(map[string]any{"features": names})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(1.0), PLate: ptr(0.1)})
+		_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), PLate: ptr(0.1)})
 	}))
 	defer srv.Close()
 
@@ -189,7 +229,7 @@ func TestPLateOutOfRangeIsFailure(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(modelInfoBody())
 			return
 		}
-		_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(1.0), PLate: ptr(1.4)})
+		_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), PLate: ptr(1.4)})
 	}))
 	defer srv.Close()
 
@@ -212,7 +252,7 @@ func TestRetriesRecoverFromServerError(t *testing.T) {
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(7.0), PLate: ptr(0.1)})
+		_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(7.0), PLate: ptr(0.1)})
 	}))
 	defer srv.Close()
 
@@ -337,7 +377,7 @@ func TestBreakerClosesOnSuccess(t *testing.T) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(3.0), PLate: ptr(0.1)})
+		_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(3.0), PLate: ptr(0.1)})
 	}))
 	defer srv.Close()
 
@@ -372,7 +412,7 @@ func TestContractCheckedOnceWhileHealthy(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(modelInfoBody())
 			return
 		}
-		_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(1.0), PLate: ptr(0.1)})
+		_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), PLate: ptr(0.1)})
 	}))
 	defer srv.Close()
 

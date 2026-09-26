@@ -190,51 +190,63 @@ def main() -> int:
     base_ts = struct.unpack_from("<I", nav_frames[0], NPL_SIZE + NPH_SIZE + 2)[0]
     print(f"golden-кадров: {len(frames)}, с Nav00: {len(nav_frames)}, базовая метка: {base_ts}")
 
-    sock = socket.create_connection((args.host, args.port), timeout=5)
-    sock.settimeout(0.2)
-    sock.sendall(build_handshake(args.unit))
-    try:
-        sock.recv(4096)  # ответ сервера на handshake (если есть) — игнорируем
-    except socket.timeout:
-        pass
-    print(f"handshake отправлен на {args.host}:{args.port}, unit_id={args.unit}")
-
     sent = 0
     req = 0
     cycle = 4125  # шаг серии golden-кадров по долготе, 1e-7°
     t_feed = time.time()
-    try:
-        while True:
-            now_ts = int(time.time())
-            if sent == 0:
-                # предзагрузка: окно точек за --seed-window секунд до «сейчас»,
-                # иначе первому тику конвейера нечего положить в окно признаков
-                k = max(1, len(nav_frames))
-                span = args.seed_window
-                for i in range(k):
-                    ts = now_ts - int(span) + int(span * i / max(1, k - 1) * 0.999)
+    # Цикл переподключения: рестарт gateway на демо — штатная операция, и
+    # поток обязан возобновиться сам, без человека с клавиатурой.
+    while True:
+        try:
+            sock = socket.create_connection((args.host, args.port), timeout=5)
+        except OSError as e:
+            print(f"подключение к {args.host}:{args.port} не поднялось ({e}) — повтор через 2 с")
+            time.sleep(2)
+            continue
+        sock.settimeout(0.2)
+        req += 1
+        sock.sendall(build_handshake(args.unit))
+        try:
+            sock.recv(4096)  # ответ сервера на handshake (если есть) — игнорируем
+        except socket.timeout:
+            pass
+        print(f"handshake отправлен на {args.host}:{args.port}, unit_id={args.unit}")
+        sent = 0  # после перерыва заново предзагружаем окно: конвейеру нужны
+                  # свежие точки за --seed-window, разрыв в накопителе недопустим
+        try:
+            while True:
+                now_ts = int(time.time())
+                if sent == 0:
+                    # предзагрузка: окно точек за --seed-window секунд до «сейчас»,
+                    # иначе первому тику конвейера нечего положить в окно признаков
+                    k = max(1, len(nav_frames))
+                    span = args.seed_window
+                    for i in range(k):
+                        ts = now_ts - int(span) + int(span * i / max(1, k - 1) * 0.999)
+                        req += 1
+                        sock.sendall(patch_frame(nav_frames[i % len(nav_frames)], ts, req,
+                                                 lon_shift_e7=0))
+                        sent += 1
+                else:
+                    idx = sent % len(nav_frames)
+                    lap = sent // len(nav_frames)
                     req += 1
-                    sock.sendall(patch_frame(nav_frames[i % len(nav_frames)], ts, req,
-                                             lon_shift_e7=0))
+                    sock.sendall(patch_frame(nav_frames[idx], now_ts, req,
+                                             lon_shift_e7=lap * cycle))
                     sent += 1
-            else:
-                idx = sent % len(nav_frames)
-                lap = sent // len(nav_frames)
-                req += 1
-                sock.sendall(patch_frame(nav_frames[idx], now_ts, req,
-                                         lon_shift_e7=lap * cycle))
-                sent += 1
-            try:
-                sock.recv(65536)  # дренируем входящие (ack/result), сокет не блокируется
-            except (socket.timeout, BlockingIOError):
-                pass
-            time.sleep(args.every)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        sock.close()
-    print(f"отправлено realtime-кадров: {sent} за {time.time() - t_feed:.1f} с")
-    return 0
+                try:
+                    sock.recv(65536)  # дренируем входящие (ack/result), сокет не блокируется
+                except (socket.timeout, BlockingIOError):
+                    pass
+                time.sleep(args.every)
+        except KeyboardInterrupt:
+            print(f"отправлено realtime-кадров: {sent} за {time.time() - t_feed:.1f} с")
+            return 0
+        except (BrokenPipeError, ConnectionResetError):
+            print("связь потеряна — переподключение через 2 с")
+        finally:
+            sock.close()
+        time.sleep(2)
 
 
 if __name__ == "__main__":

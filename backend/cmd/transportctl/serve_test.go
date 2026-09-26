@@ -36,12 +36,14 @@ func TestPredictorChainUsesModelWhenAddressGiven(t *testing.T) {
 		switch r.URL.Path {
 		case "/model/info":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"version":       "v1",
-				"feature_names": predictor.FeatureContract(),
+				"version":  "v1",
+				"features": predictor.FeatureContract(),
 			})
 		case "/predict":
+			// Ответ сервиса — готовая сумма (ADR-0007): cur_dev_s 60 +
+			// добавка 30, какую проверяет тест ниже.
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"delta_s": 30.0, "p_late": 0.4, "model_version": "v1",
+				"delay_s": 90.0, "p_late": 0.4, "model_version": "v1",
 			})
 		default:
 			http.NotFound(w, r)
@@ -50,7 +52,8 @@ func TestPredictorChainUsesModelWhenAddressGiven(t *testing.T) {
 	defer srv.Close()
 
 	frame := serveFrame()
-	p := predictorChain(srv.URL, time.Second, quietServeLogger()).Predict(t.Context(), frame)
+	chain, _ := predictorChain(srv.URL, time.Second, quietServeLogger())
+	p := chain.Predict(t.Context(), frame)
 	if p.Source != predictor.SourceML {
 		t.Fatalf("источник %q, ожидалась модель", p.Source)
 	}
@@ -65,7 +68,8 @@ func TestPredictorChainUsesModelWhenAddressGiven(t *testing.T) {
 // Без адреса модели прогноз обязан отдавать baseline, а не молчать и не
 // падать: сервер поднимают на площадке раньше, чем появится ML-сервис.
 func TestPredictorChainFallsBackToBaselineWithoutModel(t *testing.T) {
-	p := predictorChain("", 0, quietServeLogger()).Predict(t.Context(), serveFrame())
+	chain, _ := predictorChain("", 0, quietServeLogger())
+	p := chain.Predict(t.Context(), serveFrame())
 	if p.Source != predictor.SourceBaseline {
 		t.Errorf("источник %q, ожидался baseline", p.Source)
 	}
@@ -80,14 +84,14 @@ func TestPredictorChainSurvivesDeadModel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/model/info" {
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"version":       "v1",
-				"feature_names": predictor.FeatureContract(),
+				"version":  "v1",
+				"features": predictor.FeatureContract(),
 			})
 			return
 		}
 		http.Error(w, "модель упала", http.StatusInternalServerError)
 	}))
-	chain := predictorChain(srv.URL, 200*time.Millisecond, quietServeLogger())
+	chain, _ := predictorChain(srv.URL, 200*time.Millisecond, quietServeLogger())
 	srv.Close()
 
 	p := chain.Predict(t.Context(), serveFrame())
@@ -182,13 +186,23 @@ func TestBuildServiceDeliversPredictionToGateway(t *testing.T) {
 		switch r.URL.Path {
 		case "/model/info":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"version":       "v1",
-				"feature_names": predictor.FeatureContract(),
+				"version":  "v1",
+				"features": predictor.FeatureContract(),
 			})
 		case "/predict":
 			modelCalls.add(1)
+			// Ответ сервиса — готовая сумма (ADR-0007): возвращаем
+			// cur_dev_s из запроса плюс проверяемая добавка 42.
+			var rq struct {
+				CurDev *float64 `json:"cur_dev_s"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&rq)
+			delay := 42.0
+			if rq.CurDev != nil {
+				delay += *rq.CurDev
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"delta_s": 42.0, "p_late": 0.75, "model_version": "v1",
+				"delay_s": delay, "p_late": 0.75, "model_version": "v1",
 			})
 		default:
 			http.NotFound(w, r)
@@ -202,6 +216,7 @@ func TestBuildServiceDeliversPredictionToGateway(t *testing.T) {
 
 	addr := freeAddr(t)
 	store := statestore.New()
+	chain, ml := predictorChain(mlSrv.URL, 2*time.Second, quietServeLogger())
 	svc, err := buildService(serviceOptions{
 		Pipeline: pipeline.Config{
 			Store:    store,
@@ -211,7 +226,8 @@ func TestBuildServiceDeliversPredictionToGateway(t *testing.T) {
 			Grid:   time.Second,
 			Logger: quietServeLogger(),
 		},
-		Predictor: predictorChain(mlSrv.URL, 2*time.Second, quietServeLogger()),
+		Predictor: chain,
+		ML:        ml,
 		Queue:     8,
 		HTTPAddr:  addr,
 		Logger:    quietServeLogger(),
@@ -249,10 +265,12 @@ func TestBuildServiceDeliversPredictionToGateway(t *testing.T) {
 	// точки, поэтому идентификатор вычисляется, а не подглядывается.
 	sampleID := fmt.Sprintf("1_%d", now.Unix())
 	one := waitBody(t, "http://"+addr+"/api/v1/predictions/"+sampleID)
-	// Добавка модели 42 секунды обязана дойти до клиента: иначе по всему
-	// звену прошёл нулевой baseline, и потери не видно.
-	if !strings.Contains(one, `"delta_s": 42`) {
-		t.Errorf("прогноз %s без добавки модели: %s", sampleID, one)
+	// Прогноз модели обязан дойти до клиента. Кадр синтетической точки
+	// приходит без измеренного cur_dev_s, поэтому проверяем итоговое
+	// отклонение (delay_s), а не вычитаемую из него добавку: иначе по
+	// всему звену прошёл бы нулевой baseline, и потери не видно.
+	if !strings.Contains(one, `"predicted_dev_s": 42`) {
+		t.Errorf("прогноз %s без ответа модели: %s", sampleID, one)
 	}
 	if got := svc.Scheduler.Stats().Predicted; got != 1 {
 		t.Errorf("Predicted %d, ожидался 1", got)

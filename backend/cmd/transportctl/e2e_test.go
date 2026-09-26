@@ -44,8 +44,9 @@ type feedCard struct {
 }
 
 type feedPred struct {
-	DeltaS float64 `json:"delta_s"`
-	Source string  `json:"source"`
+	DeltaS        float64 `json:"delta_s"`
+	PredictedDevS float64 `json:"predicted_dev_s"`
+	Source        string  `json:"source"`
 }
 
 // TestGoldenStreamReachesDashboard гонит настоящий поток пакетов через все
@@ -72,17 +73,29 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 		switch r.URL.Path {
 		case "/model/info":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"version": "v1", "feature_names": predictor.FeatureContract(),
+				"version": "v1", "features": predictor.FeatureContract(),
 			})
 		case "/predict":
 			singleCalls.Add(1)
+			// Сервис отдаёт готовую сумму (ADR-0007): фейк читаем cur_dev_s
+			// из запроса и возвращаем delay_s = cur_dev_s + 42, чтобы
+			// проверяемая добавка осталась 42.
+			var rq struct {
+				CurDev *float64 `json:"cur_dev_s"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&rq)
+			delay := 42.0
+			if rq.CurDev != nil {
+				delay += *rq.CurDev
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"delta_s": 42.0, "p_late": 0.75, "model_version": "v1",
+				"delay_s": delay, "p_late": 0.75, "model_version": "v1",
 			})
 		case "/predict/batch":
 			var req struct {
 				Frames []struct {
-					SampleID string `json:"sample_id"`
+					SampleID string   `json:"sample_id"`
+					CurDevS  *float64 `json:"cur_dev_s"`
 				} `json:"frames"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -93,8 +106,14 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 			batchFrames.Add(int64(len(req.Frames)))
 			out := make([]map[string]any, 0, len(req.Frames))
 			for _, f := range req.Frames {
+				// Как и в одиночном фейке: ответ — готовая сумма,
+				// проверяемая добавка 42 вычитается на стороне клиента.
+				delay := 42.0
+				if f.CurDevS != nil {
+					delay += *f.CurDevS
+				}
 				out = append(out, map[string]any{
-					"sample_id": f.SampleID, "delta_s": 42.0,
+					"sample_id": f.SampleID, "delay_s": delay,
 					"p_late": 0.75, "model_version": "v1",
 				})
 			}
@@ -118,6 +137,7 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 	clock := &replayClock{at: at}
 	observer := telemetry.New(nil,
 		telemetry.WithLogger(quietServeLogger()), telemetry.WithClock(clock.Now))
+	chain, ml := predictorChain(mlSrv.URL, 2*time.Second, quietServeLogger())
 	svc, err := buildService(serviceOptions{
 		Pipeline: pipeline.Config{
 			Store: store, Schedule: writePlanCSV(t, at), Binding: binding,
@@ -125,7 +145,8 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 			// Секундная сетка: в тесте не пять минут ждать первую границу.
 			Grid: time.Second, Logger: quietServeLogger(),
 		},
-		Predictor: predictorChain(mlSrv.URL, 2*time.Second, quietServeLogger()),
+		Predictor: chain,
+		ML:        ml,
 		Queue:     8,
 		HTTPAddr:  addr,
 		Logger:    quietServeLogger(),
@@ -173,8 +194,9 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 		SpeedKmh      float64 `json:"speed_kmh"`
 		Stale         bool    `json:"stale"`
 		Prediction    *struct {
-			DeltaS float64 `json:"delta_s"`
-			Source string  `json:"source"`
+			DeltaS        float64 `json:"delta_s"`
+			PredictedDevS float64 `json:"predicted_dev_s"`
+			Source        string  `json:"source"`
 		} `json:"prediction"`
 	}
 	if err := json.Unmarshal([]byte(card), &got); err != nil {
@@ -202,10 +224,12 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 	if got.Prediction == nil {
 		t.Fatalf("в карточке нет прогноза: %s", card)
 	}
-	// Добавка модели обязана дойти: иначе по всему звену прошёл нулевой
-	// baseline, и потери не видно.
-	if got.Prediction.DeltaS != 42 {
-		t.Errorf("добавка модели %g, ожидалось 42", got.Prediction.DeltaS)
+	// Прогноз модели обязан дойти: иначе по всему звену прошёл нулевой
+	// baseline, и потери не видно. В золотом кадре cur_dev_s не измерен,
+	// поэтому проверяется итоговое отклонение (delay_s), а не вычитаемая
+	// из него добавка.
+	if got.Prediction.PredictedDevS != 42 {
+		t.Errorf("прогноз модели %g, ожидалось 42", got.Prediction.PredictedDevS)
 	}
 	if got.Prediction.Source != string(predictor.SourceML) {
 		t.Errorf("источник прогноза %q, ожидался %q", got.Prediction.Source, predictor.SourceML)
@@ -250,7 +274,7 @@ func TestGoldenStreamReachesDashboard(t *testing.T) {
 	if fromFeed.TRID != 1 {
 		t.Errorf("в карточке ленты tr_id %d, ожидался 1: привязка не доехала", fromFeed.TRID)
 	}
-	if fromFeed.Prediction == nil || fromFeed.Prediction.DeltaS != 42 {
+	if fromFeed.Prediction == nil || fromFeed.Prediction.PredictedDevS != 42 {
 		t.Errorf("в карточке ленты нет добавки модели: %+v", fromFeed.Prediction)
 	}
 

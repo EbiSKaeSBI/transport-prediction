@@ -16,7 +16,7 @@ EMU_UNITS ?= --unit 664030:3000 --unit 794446:3000
 # delay_delta_s + сборка cur_dev+дельта (v3, §5.1 architecture.md)
 ML_TARGET ?= abs
 # артефакт для ML-сервиса (make ml-serve); пусто — fallback-режим cur_dev_s (§4.7)
-ML_MODEL ?= ml/artifacts/model_v1v3b.json
+ML_MODEL ?= ml/artifacts/model_v1online.json
 ML_PORT ?= 8000
 
 .DEFAULT_GOAL := help

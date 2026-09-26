@@ -150,7 +150,7 @@ def test_cli_inner_join_mini(mini):
     assert f1['day_of_week'].item() == 2  # вторник, ISO
     # --- пропущенные фичи контракта существуют и null ---
     for col in ('trend_5', 'dwell_p90_route_s', 'speed_deficit_ratio_5m',
-                'n_vehicles_on_route', 'heading_error_deg', 'layover_min'):
+                'n_vehicles_on_route'):
         assert col in ds.columns
         assert ds[col].null_count() == ds.height
 

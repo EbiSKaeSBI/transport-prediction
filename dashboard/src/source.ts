@@ -200,5 +200,13 @@ export async function detectSource(store: Store): Promise<DataSource> {
   const params = new URLSearchParams(window.location.search)
   const wsUrl = params.get('ws')
   if (wsUrl) return new WsSource(store, wsUrl)
-  return new ReplaySource(store, params.get('stream') ?? '/demo/stream.ndjson')
+  // Live — режим по умолчанию: демо показывает себя как на площадке, а не
+  // как прокрутку записи. URL считается от текущего хоста: в dev vite
+  // проксирует /ws на gateway :8080, в проде сам gateway отдаёт фронт.
+  // Replay остаётся явным: ?replay=1 или свой ?stream=…ndjson.
+  if (params.get('replay') != null || params.get('stream') != null) {
+    return new ReplaySource(store, params.get('stream') ?? '/demo/stream.ndjson')
+  }
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return new WsSource(store, `${proto}//${window.location.host}/ws/stream`)
 }

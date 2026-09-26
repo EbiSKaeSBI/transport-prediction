@@ -56,6 +56,10 @@ type Config struct {
 	// Predictor — цепочка прогнозов. При nil ответы не считаются, и
 	// /readyz объясняет почему.
 	Predictor predictor.Predictor
+	// ML — клиент модели сверх цепочки: из его Stats() /readyz и /metrics
+	// показывают расхождение контракта и состояние автомата. При nil
+	// (режим baseline без модели) проверка модели не выставляется.
+	ML *predictor.MLClient
 	// IncidentCap, PredictionCap, LatencyWindow — вместимости хранилищ.
 	// Неположительные значения берутся умолчательными.
 	IncidentCap   int

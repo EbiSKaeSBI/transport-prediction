@@ -332,9 +332,10 @@ func values(f features.Set, horizonS float64) map[string]*float64 {
 	addF("dwell_last_s", f.DwellLastS)
 	addF("distance_to_target_m", f.DistanceToTargetM)
 	addI("stops_remaining", f.StopsRemaining)
-	addF("heading_error_deg", f.HeadingErrorDeg)
+	// heading_error_deg и layover_min из контракта убраны: в реальной
+	// записи они не приходят никогда (целиком null-колонки в датасете),
+	// а контракт объявляет только то, что способно нести данные.
 	addF("route_progress", f.RouteProgress)
-	addF("layover_min", f.LayoverMin)
 	addF("drift_last3_slope", f.DriftLast3Slope)
 	add("consecutive_late_stops", float64(f.ConsecutiveLateStops))
 	add("target_ambiguous", boolF(f.TargetAmbiguous))
@@ -361,8 +362,8 @@ var featureNames = []string{
 	"is_terminal_stop", "manual_fill",
 	"speed_current", "speed_seg_avg", "speed_seg_max",
 	"dwell_current_s", "dwell_last_s", "distance_to_target_m",
-	"stops_remaining", "heading_error_deg", "route_progress",
-	"layover_min", "drift_last3_slope", "consecutive_late_stops",
+	"stops_remaining", "route_progress", "drift_last3_slope",
+	"consecutive_late_stops",
 	"target_ambiguous", "horizon_s",
 }
 

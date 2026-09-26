@@ -42,9 +42,7 @@ sections:
       dwell_last_s: {type: float32, unit: s, nullable: true}
       distance_to_target_m: {type: float32, unit: m, nullable: true}
       stops_remaining: {type: int32, unit: count, nullable: true}
-      heading_error_deg: {type: float32, unit: deg, nullable: true}
       route_progress: {type: float32, unit: ratio, nullable: true, min: 0.0, max: 1.0}
-      layover_min: {type: float32, unit: min, nullable: true}
       drift_last3_slope: {type: float32, unit: s_per_stop, nullable: true}
       consecutive_late_stops: {type: int32, unit: count, nullable: false}
 

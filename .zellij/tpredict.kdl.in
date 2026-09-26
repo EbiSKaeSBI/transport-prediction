@@ -22,7 +22,9 @@ layout {
         pane name="lazygit" cwd="@ROOT@" command="@ROOT@/.zellij/run-tui.sh"
     }
     tab name="log" {
+        pane name="ml" cwd="@ROOT@" command="@ROOT@/.zellij/run-ml.sh"
         pane name="backend" cwd="@ROOT@" command="@ROOT@/.zellij/run-backend.sh"
+        pane name="feed" cwd="@ROOT@" command="@ROOT@/.zellij/run-feed.sh"
         pane name="dashboard" cwd="@ROOT@/dashboard" command="@ROOT@/.zellij/run-dashboard.sh"
         pane name="emulator" cwd="@ROOT@" command="@ROOT@/.zellij/run-emulator.sh"
     }

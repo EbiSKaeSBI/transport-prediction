@@ -142,10 +142,11 @@ func runServe(args []string) error {
 			"остановок", plan.StopsCount(), "единиц", binding.Len())
 	}
 
-	pred := predictorChain(*mlURL, *mlTimeout, logger)
+	pred, ml := predictorChain(*mlURL, *mlTimeout, logger)
 	service, err := buildService(serviceOptions{
 		Pipeline:  cfg,
 		Predictor: pred,
+		ML:        ml,
 		Queue:     *queueSize,
 		Batch:     *batchSize,
 		HTTPAddr:  *httpAddr,
@@ -207,12 +208,15 @@ type serviceOptions struct {
 	// сборка, потому что кадры уходят в планировщик, а не в журнал.
 	Pipeline  pipeline.Config
 	Predictor predictor.Predictor
-	Queue     int
-	Batch     int
-	HTTPAddr  string
-	DryRun    bool
-	Verbose   bool
-	Logger    *slog.Logger
+	// ML — клиент модели для показателей готовности; nil, когда модель не
+	// настроена: тогда /readyz и /metrics просто не показывают её состояние.
+	ML       *predictor.MLClient
+	Queue    int
+	Batch    int
+	HTTPAddr string
+	DryRun   bool
+	Verbose  bool
+	Logger   *slog.Logger
 }
 
 // service — собранный сервис: конвейер, планировщик, гейтвей и лента.
@@ -264,6 +268,7 @@ func buildService(opts serviceOptions) (*service, error) {
 			Schedule:  opts.Pipeline.Schedule,
 			Binding:   opts.Pipeline.Binding,
 			Predictor: opts.Predictor,
+			ML:        opts.ML,
 			Hub:       hub,
 			// Метрики очереди и инференции читаются через замыкания: к
 			// моменту чтения планировщик уже собран, а гейтвей не должен
@@ -309,15 +314,28 @@ func buildService(opts serviceOptions) (*service, error) {
 // сервис модели. Отдельная функция, а не код внутри runServe, потому что
 // состав цепочки — это контракт с ML-разработчиком, и он обязан быть
 // проверяемым тестом, а не чтением флага.
-func predictorChain(mlURL string, timeout time.Duration, logger *slog.Logger) predictor.Predictor {
+func predictorChain(mlURL string, timeout time.Duration,
+	logger *slog.Logger) (predictor.Predictor, *predictor.MLClient) {
 	if mlURL == "" {
 		logger.Info("модель не задана: прогноз отдаёт baseline, то есть cur_dev_s без добавки",
 			"подсказка", "перезапустите с --ml http://адрес:порт, когда сервис модели будет доступен")
-		return predictor.BaselinePredictor{}
+		return predictor.BaselinePredictor{}, nil
 	}
 	logger.Info("модель подключена", "адрес", mlURL, "таймаут", timeout)
-	pred := predictor.NewMLClient(predictor.MLConfig{BaseURL: mlURL, Timeout: timeout})
-	return predictor.NewFallback(pred, predictor.BaselinePredictor{}, 0)
+	ml := predictor.NewMLClient(predictor.MLConfig{BaseURL: mlURL, Timeout: timeout})
+	// Контракт признаков сверяется ещё при старте: молчаливый откат всех
+	// прогнозов в baseline при рассинхроне с моделью выглядит как «всё
+	// работает», а прогноз — нет (ADR-0002).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := ml.CheckContract(ctx); err != nil {
+		logger.Error("контракт признаков модели не совпал с кадром: прогнозы пойдут по baseline",
+			"ошибка", err.Error(),
+			"подсказка", "сравните GET /model/info сервиса модели с features/v1.yaml")
+	} else {
+		logger.Info("контракт модели совпал с кадром", "версия", ml.Stats().Version)
+	}
+	return predictor.NewFallback(ml, predictor.BaselinePredictor{}, 0), ml
 }
 
 // inferenceWindow достаёт окно замеров у настроенной цепочки прогноза.

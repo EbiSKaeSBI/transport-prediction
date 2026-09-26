@@ -406,8 +406,8 @@ func nullableFeature(name string) bool {
 	switch name {
 	case "plan_travel_s", "slack_s", "cur_dev_s", "headway_s", "trip_index",
 		"speed_seg_avg", "speed_seg_max", "dwell_last_s",
-		"distance_to_target_m", "stops_remaining", "heading_error_deg",
-		"route_progress", "layover_min", "drift_last3_slope":
+		"distance_to_target_m", "stops_remaining",
+		"route_progress", "drift_last3_slope":
 		return true
 	}
 	return false

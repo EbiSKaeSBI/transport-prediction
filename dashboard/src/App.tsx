@@ -29,10 +29,16 @@ export default function App() {
   const [rate, setRate] = useState<number>(60)
   const [paused, setPaused] = useState(false)
   const [selected, setSelected] = useState<number | null>(null)
-  const [live] = useState(() => new URLSearchParams(window.location.search).has('ws'))
+  const [live] = useState(() => {
+    // То же правило, что в detectSource: live по умолчанию, replay только
+    // явно (?replay или ?stream=…). Свой ?ws= тоже live.
+    const p = new URLSearchParams(window.location.search)
+    return p.has('ws') || (p.get('replay') == null && p.get('stream') == null)
+  })
   const [webgl] = useState(hasWebGL)
 
   useEffect(() => {
+    if (live) return // в live карта рисуется из кадров потока, geojson не нужен
     let mounted = true
     fetch('/demo/routes.geojson')
       .then(r => {

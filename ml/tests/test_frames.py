@@ -48,9 +48,10 @@ def test_missing_value_keys_are_null_not_zero(train):
     assert two['cur_dev_s'].null_count() == 2
     present = train.filter(pl.col('sample_id') == '122048_1767666300')
     assert present['cur_dev_s'].item() == pytest.approx(0.0)
-    # heading_error_deg и layover_min не приходят из Go никогда -> целые null-колонки.
-    assert train['heading_error_deg'].null_count() == train.height
-    assert train['layover_min'].null_count() == train.height
+    # heading_error_deg и layover_min мёртвые поля: в записи не приходят
+    # никогда, из контракта v1 убраны (#36) — колонок в датасете нет вовсе.
+    assert 'heading_error_deg' not in train.columns
+    assert 'layover_min' not in train.columns
 
 
 def test_quality_features_present(train):

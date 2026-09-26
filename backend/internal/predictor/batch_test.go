@@ -60,12 +60,22 @@ func batchHandler(t *testing.T, reply func(frames []predictRequest) []predictRes
 	return srv, &calls
 }
 
+// total — сервис по ADR-0007 отвечает готовой суммой: к измеренному
+// отклонению кадра добавляем выученную приращию. Фейк считает её так же,
+// иначе клиент при разборе вычтет не то.
+func total(f predictRequest, delta float64) float64 {
+	if v, ok := f.Features["cur_dev_s"]; ok && v != nil {
+		return *v + delta
+	}
+	return delta
+}
+
 // okFor — честный ответ по каждому кадру: добавка 10, p_late 0.5.
 func okFor(frames []predictRequest) []predictResponse {
 	out := make([]predictResponse, len(frames))
 	for i, f := range frames {
 		out[i] = predictResponse{
-			SampleID: f.SampleID, DeltaS: ptr(10.0), PLate: ptr(0.5), ModelVersion: "v1",
+			SampleID: f.SampleID, DelayS: ptr(total(f, 10.0)), PLate: ptr(0.5), ModelVersion: "v1",
 		}
 	}
 	return out
@@ -131,7 +141,7 @@ func TestPredictBatchKeepsPerFrameAnswer(t *testing.T) {
 		out := make([]predictResponse, len(frames))
 		for i, f := range frames {
 			out[i] = predictResponse{
-				SampleID: f.SampleID, DeltaS: ptr(float64(i)), PLate: ptr(0.5),
+				SampleID: f.SampleID, DelayS: ptr(total(f, float64(i))), PLate: ptr(0.5),
 			}
 		}
 		slices.Reverse(out)
@@ -208,7 +218,7 @@ func TestSingleFrameSkipsBatchEndpoint(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(modelInfoBody())
 		case "/predict":
 			singles.Add(1)
-			_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(1.0), PLate: ptr(0.1)})
+			_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), PLate: ptr(0.1)})
 		case "/predict/batch":
 			batches.Add(1)
 			_ = json.NewEncoder(w).Encode(batchResponse{})
@@ -242,7 +252,7 @@ func TestBatchEndpointMissingIsRemembered(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(modelInfoBody())
 		case "/predict":
 			singles.Add(1)
-			_ = json.NewEncoder(w).Encode(predictResponse{DeltaS: ptr(1.0), PLate: ptr(0.1)})
+			_ = json.NewEncoder(w).Encode(predictResponse{DelayS: ptr(1.0), PLate: ptr(0.1)})
 		case "/predict/batch":
 			batches.Add(1)
 			http.NotFound(w, r)

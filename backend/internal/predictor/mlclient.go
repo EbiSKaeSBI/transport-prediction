@@ -75,7 +75,7 @@ type MLConfig struct {
 // gRPC не используется сознательно. Сервис модели пишет другой разработчик в
 // другом репозитории, и общий протобаф-контракт между ними не существует:
 // любая правка proto становится синхронным изменением в чужом репозитории.
-// HTTP+JSON с полем feature_names оставляет сверку контракта в рантайме, где
+// HTTP+JSON с полем features оставляет сверку контракта в рантайме, где
 // расхождение видно сразу, а не на этапе сборки второй стороны.
 type MLClient struct {
 	cfg     MLConfig
@@ -504,36 +504,36 @@ func (c *MLClient) request(f horizon.Frame) predictRequest {
 // для каждого элемента батча: если бы правила проверки ответа жили в двух
 // местах, они разошлись бы при первой же правке одного из них.
 func (c *MLClient) prediction(f horizon.Frame, out predictResponse) (Prediction, error) {
-	// Обязательные поля проверяются указателями: нулевая добавка и
+	// Обязательные поля проверяются указателями: нулевой прогноз и
 	// отсутствующее поле — разные вещи, а без проверки модель, забывшая
 	// поле, отвечала бы уверенным «опоздания нет».
-	if out.DeltaS == nil || out.PLate == nil {
-		return Prediction{}, errors.New("ml: в ответе нет delta_s или p_late")
-	}
-	if *out.PLate < 0 || *out.PLate > 1 {
-		return Prediction{}, fmt.Errorf("ml: p_late = %g вне [0, 1]", *out.PLate)
+	if out.DelayS == nil {
+		return Prediction{}, errors.New("ml: в ответе нет delay_s")
 	}
 	p := Prediction{
-		SampleID:     f.SampleID,
-		UnitID:       f.UnitID,
-		TRID:         f.TRID,
-		AsOf:         f.AsOf,
-		TargetStopID: f.PrimaryStopID(),
-		HorizonS:     f.HorizonS(),
-		DeltaS:       *out.DeltaS,
-		PLate:        *out.PLate,
-		ModelVersion: out.ModelVersion,
-		Source:       SourceML,
-		Missing:      f.Missing(),
+		SampleID:      f.SampleID,
+		UnitID:        f.UnitID,
+		TRID:          f.TRID,
+		AsOf:          f.AsOf,
+		TargetStopID:  f.PrimaryStopID(),
+		HorizonS:      f.HorizonS(),
+		PredictedDevS: *out.DelayS,
+		ModelVersion:  out.ModelVersion,
+		Source:        SourceML,
+		Missing:       f.Missing(),
 	}
+	// Добавка выводится из ответа: дельту модель вернула внутри delay_s,
+	// вычитаем измеренное отклонение. Если cur_dev_s не измерен, вычитать
+	// нечего и DeltaS остаётся нулём — итог в PredictedDevS при этом
+	// честный, а неполноту кадра видно по Missing.
 	if dev, ok := f.Value("cur_dev_s"); ok {
-		p.PredictedDevS = dev + p.DeltaS
-	} else {
-		// cur_dev_s не измерен, складывать нечего. Оставляем PredictedDevS
-		// равной добавке модели и не выдумываем отклонение: неизвестное
-		// отклонение, помеченное как измеренное, хуже нуля, помеченного
-		// как неизвестный.
-		p.PredictedDevS = p.DeltaS
+		p.DeltaS = *out.DelayS - dev
+	}
+	if out.PLate != nil {
+		if *out.PLate < 0 || *out.PLate > 1 {
+			return Prediction{}, fmt.Errorf("ml: p_late = %g вне [0, 1]", *out.PLate)
+		}
+		p.PLate = *out.PLate
 	}
 	return p, nil
 }
@@ -552,18 +552,109 @@ type predictRequest struct {
 	Features     map[string]*float64 `json:"features"`
 }
 
-// predictResponse — ответ POST /predict.
+// MarshalJSON пишет запрос ПЛОСКИМ словарём: имена признаков — ключами
+// верхнего уровня (контракт §4.5, `extra='allow'` на стороне FastAPI:
+// extras и есть фичи). Вложенный «features» сервер валидации не проходит,
+// и это молча проверялось только собственными фейками каждой стороны.
+// null отправляется ЯВНЫМ null, а не выкидыванием ключа: присутствие имени — то,
+// что сверяет сервер, а CatBoost понимает null как пропуск (так же, как
+// учился на null-колонках). Только cur_dev_s — исключение: без него delta
+// не собрать (ADR-0007), поэтому при null ключ отсутствует и запрос
+// честно уходит на 422 → baseline.
+func (r predictRequest) MarshalJSON() ([]byte, error) {
+	out := make(map[string]any, len(r.Features)+7)
+	for name, v := range r.Features {
+		if v != nil {
+			out[name] = *v
+		} else if name != "cur_dev_s" {
+			out[name] = nil
+		}
+	}
+	out["sample_id"] = r.SampleID
+	out["tr_id"] = r.TRID
+	out["unit_id"] = r.UnitID
+	out["t"] = r.T
+	out["target_stop_id"] = r.TargetStopID
+	out["target_ambiguous"] = r.Ambiguous
+	out["horizon_s"] = r.HorizonS
+	if v := r.Features["cur_dev_s"]; v != nil {
+		out["cur_dev_s"] = *v
+	} else {
+		delete(out, "cur_dev_s")
+	}
+	return json.Marshal(out)
+}
+
+// UnmarshalJSON читает плоский dict обратно — зеркало MarshalJSON. Нужен
+// не продакшену (сервер модели — python), а мокам: фейк обязан видеть
+// запрос ровно в той форме, в какой его видит FastAPI, а не в виде
+// внутреннего структа клиента.
+func (r *predictRequest) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	meta := []struct {
+		key string
+		dst any
+	}{
+		{"sample_id", &r.SampleID},
+		{"tr_id", &r.TRID},
+		{"unit_id", &r.UnitID},
+		{"t", &r.T},
+		{"target_stop_id", &r.TargetStopID},
+		{"target_ambiguous", &r.Ambiguous},
+	}
+	for _, m := range meta {
+		if v, ok := raw[m.key]; ok {
+			if err := json.Unmarshal(v, m.dst); err != nil {
+				return fmt.Errorf("ml: поле %q: %w", m.key, err)
+			}
+			delete(raw, m.key)
+		}
+	}
+	// horizon_s и cur_dev_s — одновременно и выделенные поля, и признаки
+	// контракта: забираем их в Features, а горизонт ещё и в поле.
+	if v, ok := raw["horizon_s"]; ok {
+		var h float64
+		if err := json.Unmarshal(v, &h); err != nil {
+			return fmt.Errorf("ml: поле %q: %w", "horizon_s", err)
+		}
+		r.HorizonS = h
+	}
+	r.Features = make(map[string]*float64, len(raw))
+	for name, v := range raw {
+		if string(v) == "null" {
+			r.Features[name] = nil
+			continue
+		}
+		var f float64
+		if err := json.Unmarshal(v, &f); err != nil {
+			return fmt.Errorf("ml: фича %q: %w", name, err)
+		}
+		r.Features[name] = &f
+	}
+	return nil
+}
+
+// predictResponse — один ответ сервиса модели (одиночный /predict или
+// элемент батча). Ключевое расхождение, которое этот разбор закрывает:
+// сервис по ADR-0007 складывает прогноз сам и отдаёт ГОТОВЫЙ delay_s, а
+// не сырую добавку; ранняя версия клиента ждала delta_s и молча считала
+// каждый ответ ошибкой (все прогнозы уходили в baseline).
 type predictResponse struct {
 	// SampleID — кадр, к которому относится ответ. В одиночном ответе поле
 	// необязательно: там запрос и ответ один, и кадр известен на стороне
 	// клиента. В батче оно обязательно и служит ключом сопоставления —
 	// без него порядок ответов пришлось бы угадывать.
 	SampleID string `json:"sample_id,omitempty"`
-	// DeltaS — добавка к cur_dev_s в секундах. Именно её предстоит
-	// выучить: метка organizers это predict_cur_dev_s, а cur_dev_s в неё
-	// входит, поэтому модель учится на разнице, а не на отклонении.
-	DeltaS *float64 `json:"delta_s"`
-	// PLate — вероятность опоздания в [0, 1].
+	// DelayS — итоговое предсказанное отклонение в секундах. По ADR-0007
+	// сервис модели складывает cur_dev_s и выученную добавку сам и наружу
+	// отдаёт уже сумму; сырой дельты в проволке нет.
+	DelayS *float64 `json:"delay_s"`
+	// PLate — вероятность опоздания в [0, 1]. Может прийти null:
+	// классификатор — это v4 (#9), регрессионная модель v1 вероятностей
+	// не знает.
 	PLate *float64 `json:"p_late"`
 	// ModelVersion — версия модели. Пустая допустима: версия нужна для
 	// разбора инцидентов, но её отсутствие прогнозу не мешает.
@@ -589,7 +680,7 @@ type batchResponse struct {
 // modelInfo — ответ GET /model/info.
 type modelInfo struct {
 	Version      string   `json:"version"`
-	FeatureNames []string `json:"feature_names"`
+	FeatureNames []string `json:"features"`
 }
 
 // fetchInfo сходит в сервис за объявлением модели. Проверка контракта из неё

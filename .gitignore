@@ -134,3 +134,5 @@ desktop.ini
 #  submission.csv           итоговый файл предсказаний — главный артефакт
 #  dashboard/{index.html,vite.config.ts,tsconfig*.json,eslint.config.js}
 #                          Vite-скелет: без них `npm run build` не соберётся
+plan.csv
+binding.csv

@@ -66,6 +66,20 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 			"прогнозов по baseline", fst.FromBase)
 	}
 
+	// Состояние клиента модели: доля деградации выше отвечает на вопрос
+	// «много ли прогнозов минуло модель», эти метрики — на вопрос «почему».
+	if ml := s.cfg.ML; ml != nil {
+		ms := ml.Stats()
+		contractOK := 1.0
+		if ms.ContractErr != nil {
+			contractOK = 0
+		}
+		value("transport_gateway_ml_contract_ok",
+			"1 если контракт признаков модели совпал с кадром", contractOK)
+		counter("transport_gateway_ml_rejected_total",
+			"обращений к модели отклонено автоматом клиента", ms.Rejected)
+	}
+
 	// Латентность прогнозов: при отказе модели её рост — первый признак
 	// того, что пора смотреть в её логи.
 	lat := s.latency.Snapshot()

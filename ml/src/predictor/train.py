@@ -154,6 +154,7 @@ def train(
     internal_val_groups: int = 4,
     tag: str = '',
     exclude: list[str] | None = None,
+    features: list[str] | None = None,
     target_mode: str = 'abs',
 ) -> dict:
     """Полный прогон v1: отбор фич, обучение, метрики, сохранение артефактов.
@@ -162,6 +163,9 @@ def train(
     'b' → model_v1b.json — вариант с hint-fallback cur_dev_s и т. п.).
     ``exclude`` — дополнительные колонки-фичи, убираемые из списка перед
     обучением (аблиации задачи #24: какие фичи движения тянут метрику вниз).
+    ``features`` — явный список колонок-фич, заменяющий отбор v1 целиком:
+    так обучают модель строго под онлайн-контракт Go (#36), где список имён
+    диктует кадр, а не отбор по null-доле. ``exclude`` применяется и к нему.
     ``target_mode`` — 'abs' (таргет ``target_delay_s``, дефолт, обратная
     совместимость v1/v1b/v2) или 'delta' (таргет ``delay_delta_s``, §5.1
     architecture.md этап v3): модель учит дельту, итоговое предсказание на
@@ -175,6 +179,14 @@ def train(
     train_df = pl.read_parquet(train_path).drop_nulls(target_col)
     holdout_df = pl.read_parquet(holdout_path).drop_nulls(target_col)
     cols, _, _ = select_features(train_df, FEATURE_VERSION)
+    if features:
+        unknown = sorted(set(features) - set(train_df.columns))
+        if unknown:
+            raise ValueError(f'явный список фич, нет таких колонок датасета: {unknown}')
+        dupes = sorted({c for c in features if features.count(c) > 1})
+        if dupes:
+            raise ValueError(f'дубли фич в явном списке: {dupes}')
+        cols = list(features)
     if exclude:
         bad = set(exclude) - set(cols)
         if bad:
@@ -224,6 +236,7 @@ def train(
         'target_mode': target_mode,
         'loss': 'MAE',
         'excluded_features': sorted(exclude or []),
+        'features_source': 'explicit' if features else 'v1-select',
         'n_train_rows': int(train_df.height),
         'n_holdout_rows': int(holdout_df.height),
         'features': cols,
@@ -270,6 +283,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument('--exclude', default='',
                     help='аблиация: список фич через запятую, убираемых из отбора '
                          'перед обучением (например trend_5,momentum)')
+    ap.add_argument('--features', default='',
+                    help='явный список фич через запятую, заменяющий отбор v1 '
+                         '(модель строго под онлайн-контракт Go, задача #36)')
     ap.add_argument('--target', choices=('abs', 'delta'), default='abs',
                     help="таргет: 'abs' — target_delay_s (дефолт, v1/v1b/v2), "
                          "'delta' — delay_delta_s, предсказание = "
@@ -277,12 +293,15 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     exclude = [c.strip() for c in args.exclude.split(',') if c.strip()] or None
+    features = [c.strip() for c in args.features.split(',') if c.strip()] or None
     metrics = train(
         args.train, args.holdout, args.out_dir,
         iterations=args.iterations, depth=args.depth, lr=args.learning_rate,
         patience=args.patience, seed=args.seed, tag=args.tag, exclude=exclude,
-        target_mode=args.target,
+        features=features, target_mode=args.target,
     )
+    if features:
+        print(f"фичи: явный список из {len(features)} имён (вместо отбора v1)")
     if exclude:
         print(f"исключены из отбора: {', '.join(exclude)}")
     b = metrics['baseline_holdout']
