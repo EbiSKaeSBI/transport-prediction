@@ -229,8 +229,10 @@ func TestTickProducesFrameForBoundUnit(t *testing.T) {
 	}
 }
 
-// Один инцидент на пару «машина, остановка»: повторные тики не плодят кадры.
-func TestTickDeduplicatesSameTarget(t *testing.T) {
+// Тики внутри одной ячейки сетки не плодят кадров. Пять тиков за пять секунд —
+// это один момент прогноза, а не пять: модель обучена на выборке с T на
+// сетке, и кадры с произвольным T не имеют с ней ничего общего.
+func TestTicksWithinOneCellProduceSingleFrame(t *testing.T) {
 	sink := &frameSink{}
 	p := newPipeline(t, routeStops(), sink)
 	now := base
@@ -240,23 +242,86 @@ func TestTickDeduplicatesSameTarget(t *testing.T) {
 		p.Tick(context.Background(), now.Add(time.Duration(i)*time.Second))
 	}
 	if got := len(sink.all()); got != 1 {
-		t.Errorf("кадров %d за пять тиков по одной цели, ожидался 1", got)
+		t.Errorf("кадров %d за пять тиков внутри ячейки, ожидался 1", got)
 	}
-	if got := p.Stats().Deduped; got != 4 {
-		t.Errorf("отброшено повторов %d, ожидалось 4", got)
+	// Отбрасывание сделала сетка, а не проверка цели: важно, потому что
+	// Deduped показывается в сводке, и два разных отказа не должны
+	// выглядеть в ней одинаково.
+	if got := p.Stats().Deduped; got != 0 {
+		t.Errorf("отброшено повторов %d, ожидался 0: тики отсекла сетка", got)
 	}
 }
 
-// Смена цели обязана породить новый кадр.
+// T округляется вниз до кратного сетки, и кадр считается по данным, которые
+// были не позже этого T. Оба свойства — контракт, а не деталь реализации.
+func TestTickFloorsTToGridAndIgnoresLaterPoints(t *testing.T) {
+	sink := &frameSink{}
+	p := newPipeline(t, routeStops(), sink)
+	// Точка в 08:04:30 — до границы ячейки.
+	appendStanding(t, p, base.Add(4*time.Minute+30*time.Second),
+		routeStops()[1].Lon, routeStops()[1].Lat)
+	// Точка в 08:06:00 — уже после неё, и в кадр попасть не должна.
+	appendStanding(t, p, base.Add(6*time.Minute),
+		routeStops()[9].Lon, routeStops()[9].Lat)
+	p.Tick(context.Background(), base.Add(6*time.Minute))
+
+	frames := sink.all()
+	if len(frames) != 1 {
+		t.Fatalf("кадров %d, ожидался 1", len(frames))
+	}
+	if want := base.Add(5 * time.Minute); !frames[0].AsOf.Equal(want) {
+		t.Errorf("T кадра %v, ожидалось %v: момент обязан лежать на сетке",
+			frames[0].AsOf, want)
+	}
+	if frames[0].SampleID != "7_"+"1767686700" {
+		t.Errorf("sample_id %q не соответствует округлённому T", frames[0].SampleID)
+	}
+	// Машина стояла у первой остановки до границы и переехала к девятой
+	// после. Кадр про первый адрес: иначе это предсказание по будущему.
+	dist := frames[0].Features.DistanceToTargetM
+	if dist == nil {
+		t.Fatal("признак расстояния не посчитан")
+	}
+	if *dist < 1000 {
+		t.Errorf("расстояние до цели %g м: взята точка из будущего", *dist)
+	}
+}
+
+// Машина, включившаяся посреди ячейки, не имеет состояния на момент начала
+// ячейки. Подставлять более поздние данные значило бы предсказать по
+// будущему, поэтому кадра не будет вовсе — и это должно быть видно в
+// счётчике, а не выглядеть как «машина спит».
+func TestUnitJoiningMidCellGetsNoFrame(t *testing.T) {
+	sink := &frameSink{}
+	p := newPipeline(t, routeStops(), sink)
+	appendStanding(t, p, base.Add(2*time.Minute), routeStops()[1].Lon, routeStops()[1].Lat)
+	p.Tick(context.Background(), base.Add(2*time.Minute))
+
+	if got := len(sink.all()); got != 0 {
+		t.Errorf("кадров %d для машины без данных на момент T, ожидался 0", got)
+	}
+	if got := p.Stats().NoStateAtT; got != 1 {
+		t.Errorf("NoStateAtT %d, ожидался 1", got)
+	}
+	// На следующей границе кадр появляется.
+	appendStanding(t, p, base.Add(3*time.Minute), routeStops()[1].Lon, routeStops()[1].Lat)
+	p.Tick(context.Background(), base.Add(5*time.Minute))
+	if got := len(sink.all()); got != 1 {
+		t.Errorf("кадров %d на следующей границе, ожидался 1", got)
+	}
+}
+
+// Новая ячейка обязана породить новый кадр, даже если машина никуда не
+// ехала: момент прогноза другой, и кадр без этого остался бы на пять минут.
 func TestTickEmitsAgainWhenTargetChanges(t *testing.T) {
 	sink := &frameSink{}
 	p := newPipeline(t, routeStops(), sink)
 	appendStanding(t, p, base, routeStops()[1].Lon, routeStops()[1].Lat)
 	p.Tick(context.Background(), base)
 
-	// Через две минуты целью станет другая остановка окна.
-	appendStanding(t, p, base.Add(2*time.Minute), routeStops()[3].Lon, routeStops()[3].Lat)
-	p.Tick(context.Background(), base.Add(2*time.Minute))
+	// На следующей границе целью станет другая остановка окна.
+	appendStanding(t, p, base.Add(5*time.Minute), routeStops()[3].Lon, routeStops()[3].Lat)
+	p.Tick(context.Background(), base.Add(5*time.Minute))
 
 	frames := sink.all()
 	if len(frames) != 2 {
@@ -300,16 +365,35 @@ func TestTickRespectsCancelledContext(t *testing.T) {
 
 // Разрыв соединения снимает отметку о цели: пока пакетов нет, повторный
 // кадр той же цели после восстановления связи отправляться не должен.
+//
+// Проверка идёт напрямую через planUnit, а не через Tick. Через Tick она
+// недостижима: момент T двигается вместе с ячейкой, а цель сдвигается на
+// следующую остановку, так что отметка о цели не совпадает никогда и
+// защита не срабатывает ни при какой сетке. Сама защита нужна для
+// повторного планирования одного и того же момента, и вот это она и
+// проверяет.
 func TestDisconnectForgetsTarget(t *testing.T) {
 	sink := &frameSink{}
 	p := newPipeline(t, routeStops(), sink)
 	appendStanding(t, p, base, routeStops()[1].Lon, routeStops()[1].Lat)
-	p.Tick(context.Background(), base)
+
+	p.planUnit(t.Context(), unitID, base)
+	if got := len(sink.all()); got != 1 {
+		t.Fatalf("кадров %d, ожидался 1", got)
+	}
+	p.planUnit(t.Context(), unitID, base)
+	if got := p.Stats().Deduped; got != 1 {
+		t.Errorf("отброшено повторов %d, ожидался 1", got)
+	}
+	if got := len(sink.all()); got != 1 {
+		t.Errorf("кадров %d при повторе того же момента, ожидался 1", got)
+	}
+
+	// После разрыва отметка снята, и тот же момент планируется заново.
 	p.OnDisconnect(unitID)
-	appendStanding(t, p, base, routeStops()[1].Lon, routeStops()[1].Lat)
-	p.Tick(context.Background(), base)
+	p.planUnit(t.Context(), unitID, base)
 	if got := len(sink.all()); got != 2 {
-		t.Errorf("кадров %d после разрыва и восстановления, ожидался 2", got)
+		t.Errorf("кадров %d после разрыва и восстановления, ожидалось 2", got)
 	}
 }
 

@@ -1,0 +1,971 @@
+openapi: 3.0.3
+
+# Спецификация гейтвея написана руками и вручную сверяется тестом с таблицей
+# маршрутов. Кодогенерации нет намеренно: список эндпоинтов фиксирован и
+# короток, а сгенерированный сервер в пакете, которому положено держать
+# минимальную поверхность, принёс бы фреймворк, чтобы нарисовать
+# тринадцать эндпоинтов. Цена ручного описания — расхождение, поэтому тест
+# сверяет пути и методы спецификации с http.ServeMux, и несовпадение
+# ломает сборку, а не продакшен.
+
+info:
+  title: Транспортный гейтвей прогнозов
+  version: "0.4.0"
+  description: |
+    Гейтвей поверх уже посчитанного: телеметрия транспорта, план-график и
+    прогноз опоздания к остановке. Признаки и кадры он не строит — это делает
+    конвейер, а гейтвей отвечает на вопросы человека.
+
+    Два способа читать состояние:
+
+    - `GET` — снимок на момент запроса. Для разовых вопросов и для всего,
+      что должно попасть в чужую систему.
+    - `GET /ws/stream` — живая лента. Снимок при подключении, потом
+      `vehicle_update`, `incident` и `metrics`.
+
+    Лента предпочтительна для приборной панели: она не спрашивает, когда ей
+    нечего показать, и поэтому не превращается в опрос в шестьдесят раз в
+    минуту на каждую вкладку.
+
+    Состояние живёт в памяти процесса. Перезапуск обнуляет инциденты и
+    историю прогнозов — это осознанный размен: приборная панель обязана
+    показывать текущую ситуацию всегда, и не должна падать вместе с базой.
+
+    Пороги риска: `green` — опоздание меньше 60 с и `p_late` меньше 0.3;
+    `yellow` — от 60 до 120 с или `p_late` от 0.3 до 0.6; `red` — от 120 с
+    или `p_late` от 0.6. Пороги обоснованы измерениями: типичная ошибка
+    baseline 93.46 с, и объявлять тревогу там, где типична ошибка самой
+    модели, значит приучить дежурного её игнорировать.
+
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск
+
+tags:
+  - name: Служебные
+    description: Живость, готовность и метрики
+  - name: Транспорт
+    description: Карточки машин и траектории
+  - name: Расписание
+    description: План-график
+  - name: Прогнозы
+    description: Прогнозы опоздания
+  - name: Инциденты
+    description: Простои и тревоги
+  - name: Лента
+    description: WebSocket-поток событий
+
+paths:
+  /healthz:
+    get:
+      tags: [Служебные]
+      summary: Живость процесса
+      description: |
+        Отвечает, только если процесс жив. Готовность — это `/readyz`:
+        перезапускать по этому эндпоинту нельзя, гейтвей без модели и без
+        расписания отвечает 200 и при этом не считает прогнозов.
+      responses:
+        "200":
+          description: Процесс жив
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, uptime_s]
+                properties:
+                  status: { type: string, example: ok }
+                  uptime_s: { type: number, format: double, example: 128.4 }
+
+  /readyz:
+    get:
+      tags: [Служебные]
+      summary: Готовность считать прогнозы
+      description: |
+        200 только если есть хранилище телеметрии, план-график и предиктор.
+        Иначе 503 с перечнем проверок, чтобы было видно, чего именно не
+        хватает, а не только «не готов».
+      responses:
+        "200":
+          description: Готов обслуживать прогнозы
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: Не готов
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
+  /metrics:
+    get:
+      tags: [Служебные]
+      summary: Метрики в формате Prometheus
+      description: |
+        Текст, а не JSON. Формат пишется руками: набор фиксирован и состоит
+        из десятка чисел, а библиотека потянула бы за собой дерево
+        зависимостей.
+
+        Главная метрика — `transport_gateway_prediction_source_ratio`, доля
+        прогнозов, взятых не из модели. Она растёт именно тогда, когда модель
+        молчит.
+      responses:
+        "200":
+          description: Текст exposition
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /openapi.yaml:
+    get:
+      tags: [Служебные]
+      summary: Эта спецификация
+      description: |
+        Отдаётся как есть, а не превращается в JSON: её должны открыть и
+        редактор, и валидатор, и человек.
+      responses:
+        "200":
+          description: Спецификация в формате YAML
+          content:
+            application/yaml:
+              schema: { type: string }
+
+  /swagger:
+    get:
+      tags: [Служебные]
+      summary: Страница описания API
+      description: |
+        Список эндпоинтов и форма ответа. Работает без интернета: внешних
+        адресов на странице нет ни одного, спецификация забирается с этого же
+        хоста. Лента `GET /ws/stream` в списке есть, но проверяется из
+        консоли браузера — это WebSocket, а не HTTP-запрос.
+      responses:
+        "200":
+          description: Страница
+          content:
+            text/html:
+              schema: { type: string }
+
+  /ws/stream:
+    get:
+      tags: [Лента]
+      summary: Живая лента событий
+      description: |
+        WebSocket по RFC 6455. Клиент ничего не спрашивает: соединение
+        только принимает.
+
+        Первыми приходят два снимка — `incident` и `vehicle_update` с текущим
+        состоянием, — и только потом изменения. Без снимка панель минуту-другую
+        показывала бы пустые карточки, хотя данные уже есть.
+
+        Дальше события трёх типов:
+
+        - `vehicle_update` — карточка машины. Не чаще раза в секунду на
+          машину; ограничение по машинам, а не на всех, чтобы пять машин в
+          красной зоне дали пять разных карточек.
+        - `incident` — инцидент открылся, обновился или закрылся. Приходит
+          сразу, а не на следующем тике.
+        - `metrics` — срез агрегатов раз в пять секунд.
+
+        Ограничения: клиент, который не успевает читать, получает
+        `1013 Too Slow` и отключается; пинг раз в 25 секунд держит соединение
+        через прокси, которые ровно молча рвут молчащее соединение. Если лента
+        не настроена, соединение закрывается сразу кодом `1001`, а не висит
+        заглушкой.
+      responses:
+        "101":
+          description: Соединение переключено на WebSocket
+        "426":
+          description: Запрос без заголовка Upgrade
+
+  /api/v1/vehicles:
+    get:
+      tags: [Транспорт]
+      summary: Все известные машины
+      description: |
+        Карточка собирается из телеметрии, расписания и последнего
+        прогноза. Снимок берётся без глобальной блокировки хранилища:
+        хранилище шардировано, и снимок под блокировкой увидел бы часть
+        шардов обновлёнными, а часть нет, а ещё остановил бы приём телеметрии
+        на всё время, пока человек открывает страницу. Поэтому `as_of`
+        говорит, на какой момент собраны данные.
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Список карточек
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vehicles, count, as_of]
+                properties:
+                  vehicles:
+                    type: array
+                    items: { $ref: "#/components/schemas/Vehicle" }
+                  count: { type: integer }
+                  as_of: { type: string, format: date-time }
+        "503":
+          $ref: "#/components/responses/StoreUnavailable"
+
+  /api/v1/vehicles/{id}:
+    get:
+      tags: [Транспорт]
+      summary: Карточка одной машины
+      parameters:
+        - $ref: "#/components/parameters/UnitId"
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Карточка
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Vehicle" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/vehicles/{id}/trajectory:
+    get:
+      tags: [Транспорт]
+      summary: Траектория машины
+      description: |
+        Точки берутся из кольца телеметрии, то есть их не может быть больше
+        `capacity` в ответе. Глубина истории в минутах зависит от частоты
+        пакетов: медиана шага около 9 с, и кольцо на 20 000 точек — это
+        примерно 50 часов. Ограничение объявлено в ответе явно, иначе клиент
+        решит, что у него вся история смены.
+      parameters:
+        - $ref: "#/components/parameters/UnitId"
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+          description: Начало интервала. Отсутствие поля означает «с начала кольца».
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+          description: Конец интервала, включительно.
+      responses:
+        "200":
+          description: Точки траектории
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unit_id, points, count, held, capacity, from, to]
+                properties:
+                  unit_id: { type: integer, format: int64 }
+                  points:
+                    type: array
+                    items: { $ref: "#/components/schemas/TelemetryPoint" }
+                  count: { type: integer, description: Сколько точек отдано }
+                  held: { type: integer, description: Сколько точек лежит в кольце }
+                  capacity:
+                    type: integer
+                    description: Ёмкость кольца; held не может быть больше
+                  from: { type: string, format: date-time }
+                  to: { type: string, format: date-time }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/StoreUnavailable"
+
+  /api/v1/routes:
+    get:
+      tags: [Расписание]
+      summary: Маршруты по транспортным средствам
+      responses:
+        "200":
+          description: Список маршрутов
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [routes, count]
+                properties:
+                  routes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Route" }
+                  count: { type: integer }
+        "503":
+          $ref: "#/components/responses/ScheduleUnavailable"
+
+  /api/v1/routes/{id}/stops:
+    get:
+      tags: [Расписание]
+      summary: Остановки транспортного средства
+      description: |
+        `action_id` этой строки и есть `target_stop_id` в прогнозе: им
+        обозначается остановка, к которой машина едет и к которой опоздает.
+      parameters:
+        - $ref: "#/components/parameters/TRID"
+      responses:
+        "200":
+          description: Остановки по времени возрастания
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tr_id, stops, count]
+                properties:
+                  tr_id: { type: integer, format: int64 }
+                  stops:
+                    type: array
+                    items: { $ref: "#/components/schemas/Stop" }
+                  count: { type: integer }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ScheduleUnavailable"
+
+  /api/v1/predictions/{sample_id}:
+    get:
+      tags: [Прогнозы]
+      summary: Прогноз по идентификатору выборки
+      description: |
+        `sample_id` — это `<tr_id>_<unix(T)>` с T, округлённым вниз до
+        сетки 300 с. Одинаковый T на всех машинах — условие того, что
+        выборка остаётся выборкой, а не сбором разнородных кадров.
+      parameters:
+        - name: sample_id
+          in: path
+          required: true
+          schema: { type: string }
+          example: "7_1767686400"
+      responses:
+        "200":
+          description: Прогноз
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Prediction" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/predict:
+    post:
+      tags: [Прогнозы]
+      summary: Разовый прогноз по переданному кадру
+      description: |
+        Эндпоинт для проверки деградации и для сверки с моделью. Принимает
+        признаки, обращается к предиктору и отдаёт прогноз.
+
+        В историю результат не кладётся: это разовый запрос, а засорять им
+        хранилище и вытеснять настоящие прогнозы конвейера незачем.
+
+        Имена признаков сверяются с контрактом модели. Опечатка в имени
+        даёт 400, а не уезжает в модель как «не измерено»: пропуск должен
+        быть явным `null`, иначе через API вернулся бы ровно тот дефект,
+        который чинили в конвейере.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PredictRequest" }
+            example:
+              sample_id: "7_1767686400"
+              unit_id: 4242
+              tr_id: 7
+              t: "2026-01-06T08:00:00Z"
+              target_stop_id: 114
+              target_ambiguous: false
+              features:
+                plan_travel_s: 412.0
+                slack_s: 38.5
+                cur_dev_s: 45.2
+                headway_s: 47.0
+                trip_index: 12
+                is_terminal_stop: 0
+                manual_fill: 0
+                speed_current: 18.0
+                speed_seg_avg: 22.5
+                speed_seg_max: 27.9
+                dwell_current_s: 30
+                dwell_last_s: 25
+                distance_to_target_m: 820.0
+                stops_remaining: 3
+                heading_error_deg: 2.4
+                route_progress: 0.41
+                layover_min: 0
+                drift_last3_slope: null
+                consecutive_late_stops: 1
+                target_ambiguous: 0
+                horizon_s: 600
+      responses:
+        "200":
+          description: Прогноз
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Prediction" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          description: Тело больше предела
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: Предиктор не настроен
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/incidents:
+    get:
+      tags: [Инциденты]
+      summary: Список инцидентов
+      description: |
+        Без параметров отдаются незакрытые инциденты: история закрытых
+        интересует разбору, а не дежурному, и она растёт без границ.
+        Открытые и взятые в работу — вместе, потому что это один список
+        работы, а не два.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, acked, resolved]
+          description: |
+            Фильтр по состоянию. Без поля — все незакрытые. Значение
+            `resolved` вернёт закрытые.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+          description: Сколько записей вернуть
+      responses:
+        "200":
+          description: Список инцидентов
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [incidents, count, stats]
+                properties:
+                  incidents:
+                    type: array
+                    items: { $ref: "#/components/schemas/Incident" }
+                  count: { type: integer }
+                  stats: { $ref: "#/components/schemas/IncidentStats" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/incidents/{id}:
+    get:
+      tags: [Инциденты]
+      summary: Один инцидент
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Инцидент
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/incidents/{id}/ack:
+    post:
+      tags: [Инциденты]
+      summary: Взять инцидент в работу
+      description: |
+        Подтверждение человеком. Идёт в ленту сразу: вторая смена обязана
+        знать, что про простой уже знают.
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [acked_by]
+              properties:
+                acked_by:
+                  type: string
+                  minLength: 1
+                  description: "Кто взял. Обязательно: инцидент без виновника бессмыслен"
+                note:
+                  type: string
+                  description: |
+                    Свободный текст. Не валидируется: это заметка человека, и
+                    запрещать ему писать что-то осмысленное здесь незачем.
+            example: { acked_by: "дежурный Ковалёв", note: "вызвал наряд" }
+      responses:
+        "200":
+          description: Инцидент взят в работу
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            Инцидент уже закрыт, подтверждать нечего. Именно 409, а не 404:
+            инцидент есть, и 404 увёл бы клиента искать несуществующий
+            идентификатор.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Incident" }
+
+components:
+  parameters:
+    UnitId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор устройства из handshake
+      schema: { type: integer, format: int64, minimum: 1 }
+
+    TRID:
+      name: id
+      in: path
+      required: true
+      description: Номер транспортного средства
+      schema: { type: integer, format: int64, minimum: 1 }
+
+    IncidentId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор инцидента
+      schema: { type: string }
+
+    AsOf:
+      name: as_of
+      in: query
+      schema: { type: string, format: date-time }
+      description: |
+        На какое время построить карточку. По умолчанию — текущее. Задаётся
+        для воспроизводимой картины: «что дежурный видел в 08:10» — вопрос с
+        ответом, а не с угадайкой.
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            error: bad_request
+            detail: "идентификатор устройства должен быть положительным числом"
+    NotFound:
+      description: Не найдено
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    StoreUnavailable:
+      description: Хранилище телеметрии не настроено
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ScheduleUnavailable:
+      description: План-график не загружен
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+          description: Машиночитаемый вид ошибки
+          example: bad_request
+        detail:
+          type: string
+          description: Человеческое объяснение, что делать
+        errors:
+          type: array
+          items: { type: string }
+          description: |
+            Подробности по полям, когда их несколько. Одиночная ошибка
+            повторяется в `detail`, чтобы простой случай не требовал
+            разбора списка.
+
+    Check:
+      type: object
+      required: [name, ok]
+      properties:
+        name: { type: string, example: predictor }
+        ok: { type: boolean }
+        detail:
+          type: string
+          description: Почему проверка не прошла. Пусто, когда прошла
+
+    IncidentStats:
+      type: object
+      required: [total, open, acked, resolved]
+      properties:
+        total: { type: integer, description: В хранилище, включая закрытые }
+        open: { type: integer }
+        acked: { type: integer }
+        resolved: { type: integer }
+
+    PredictionStats:
+      type: object
+      required: [stored, total]
+      properties:
+        stored: { type: integer, description: Сколько прогнозов в хранилище }
+        total: { type: integer, description: Сколько прошло за всё время }
+
+    Readiness:
+      type: object
+      required: [ready, uptime_s, checks, incidents, predictions]
+      properties:
+        ready: { type: boolean }
+        uptime_s: { type: number, format: double }
+        checks:
+          type: array
+          items: { $ref: "#/components/schemas/Check" }
+        incidents: { $ref: "#/components/schemas/IncidentStats" }
+        predictions: { $ref: "#/components/schemas/PredictionStats" }
+
+    Risk:
+      type: string
+      enum: [green, yellow, red]
+      description: |
+        Уровень риска по прогнозу. `green` — едет в графике либо модель не
+        ждёт опоздания; `yellow` — вероятно, но в пределах обычной ошибки;
+        `red` — опоздание состоялось или почти наверняка.
+
+    Source:
+      type: string
+      enum: [ml, cached, baseline]
+      description: |
+        Откуда взят прогноз. `ml` — живой ответ модели. `cached` — последний
+        удачный ответ модели, устаревший по времени. `baseline` — без модели,
+        отклонение как есть.
+
+    Prediction:
+      type: object
+      required:
+        - sample_id
+        - target_stop_id
+        - horizon_s
+        - delta_s
+        - predicted_dev_s
+        - p_late
+        - source
+        - stale
+        - missing_features
+        - risk
+        - as_of
+      properties:
+        sample_id:
+          type: string
+          description: "<tr_id>_<unix(T)>, T округлён вниз до сетки 300 с"
+        target_stop_id:
+          type: integer
+          format: int64
+          description: Остановка, к которой машина едет
+        horizon_s:
+          type: number
+          format: double
+          description: На сколько вперёд считался прогноз, секунды
+        delta_s:
+          type: number
+          format: double
+          description: Сдвиг целевого времени остановки относительно T
+        predicted_dev_s:
+          type: number
+          format: double
+          description: Предсказанное отклонение, секунды
+        p_late:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Вероятность опоздания
+        source: { $ref: "#/components/schemas/Source" }
+        stale:
+          type: boolean
+          description: |
+            true у прогноза из кэша. Панель обязана показывать это явно:
+            устаревшая уверенность опаснее отсутствия уверенности
+        model_version:
+          type: string
+          description: Версия модели, если модель её сообщила
+        missing_features:
+          type: array
+          items: { type: string }
+          description: |
+            Имена признаков, которые не измерились и ушли в модель как
+            `null`. Не пустой список означает, что модель работала по
+            неполной картине
+        risk: { $ref: "#/components/schemas/Risk" }
+        as_of:
+          type: string
+          format: date-time
+          description: |
+            Время, к которому относится прогноз. У кэшированного оно
+            остаётся прежним, а не подменяется текущим: иначе по метке не
+            отличить свежий ответ от позаимствованного
+
+    Vehicle:
+      type: object
+      required:
+        - unit_id
+        - tr_id
+        - has_tr_id
+        - last_seen
+        - staleness_s
+        - stale
+        - speed_kmh
+        - lat
+        - lon
+        - location_valid
+        - course_deg
+        - satellites
+        - points_in_window
+        - prediction
+        - risk
+      properties:
+        unit_id: { type: integer, format: int64 }
+        tr_id:
+          type: integer
+          format: int64
+          description: |
+            Ноль, если привязки нет. Это нормальное состояние панели, а не
+            ошибка
+        has_tr_id: { type: boolean }
+        last_seen:
+          type: string
+          format: date-time
+          nullable: true
+        staleness_s:
+          type: number
+          format: double
+          description: Сколько секунд прошло с последнего пакета
+        stale:
+          type: boolean
+          description: |
+            Последний пакет старше порога. Позиция на карте тогда не
+            актуальна, и панель обязана это показывать
+        speed_kmh: { type: number, format: double }
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+        location_valid:
+          type: boolean
+          description: При false панель не должна показывать метку на карте
+        course_deg: { type: number, format: double }
+        satellites: { type: integer }
+        points_in_window:
+          type: integer
+          description: Сколько точек попало в окно признаков
+        prediction:
+          allOf: [{ $ref: "#/components/schemas/Prediction" }]
+          nullable: true
+        risk:
+          $ref: "#/components/schemas/Risk"
+        open_incident_id:
+          type: string
+          description: Текущий открытый инцидент, если он есть
+
+    TelemetryPoint:
+      type: object
+      required:
+        - unit_id
+        - event_time
+        - receive_time
+        - lat
+        - lon
+        - speed_kmh
+        - location_valid
+      properties:
+        unit_id: { type: integer, format: int64 }
+        event_time:
+          type: string
+          format: date-time
+          description: Время события по часам устройства
+        receive_time:
+          type: string
+          format: date-time
+          description: |
+            Локальное время приёма. Разность с event_time даёт задержку
+            канала
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+        speed_kmh: { type: number, format: double }
+        speed_avg_kmh: { type: number, format: double }
+        speed_instant_kmh: { type: number, format: double }
+        course_deg: { type: number, format: double }
+        satellites: { type: integer }
+        altitude: { type: number, format: double }
+        location_valid: { type: boolean }
+        odometer_km: { type: number, format: double }
+        lag_s:
+          type: number
+          format: double
+          description: receive_time минус event_time, секунды
+
+    Stop:
+      type: object
+      required: [action_id, tr_id, time_begin, has_fact, manual_fill, lon, lat, address]
+      properties:
+        action_id:
+          type: integer
+          format: int64
+          description: |
+            Идентификатор строки расписания. Он же `target_stop_id` в
+            прогнозе: им обозначается остановка, к которой едет машина
+        tr_id: { type: integer, format: int64 }
+        time_begin:
+          type: string
+          format: date-time
+          description: |
+            Плановое время прибытия. Это и есть предсказываемая величина:
+            фактическое время известно лишь постфактум
+        time_fact_begin:
+          type: string
+          format: date-time
+          description: |
+            Фактическое время прибытия. Отсутствует в validate, поэтому
+            наличие отражает `has_fact`
+        has_fact:
+          type: boolean
+          description: Заполнено ли фактическое время
+        order_date:
+          type: string
+          description: Дата рейса в исходном формате
+        manual_fill:
+          type: boolean
+          description: |
+            Строка введена вручную, плановое время могли внести неверно.
+            Такие строки ненадёжны, но это не повод молча выбрасывать их из
+            расписания — признак должен дойти до модели
+        lon: { type: number, format: double }
+        lat: { type: number, format: double }
+        address:
+          type: string
+          description: Адрес остановки для показа в интерфейсе
+
+    Route:
+      type: object
+      required: [tr_id, stops]
+      properties:
+        tr_id: { type: integer, format: int64 }
+        stops: { type: integer, description: Сколько остановок в расписании }
+        first_planned:
+          type: string
+          format: date-time
+          nullable: true
+        last_planned:
+          type: string
+          format: date-time
+          nullable: true
+
+    Incident:
+      type: object
+      required:
+        - id
+        - unit_id
+        - tr_id
+        - target_stop_id
+        - status
+        - risk
+        - opened_at
+        - updated_at
+        - acked_at
+        - acked_by
+        - resolved_at
+        - predicted_dev_s
+        - p_late
+        - stale
+        - source
+      properties:
+        id:
+          type: string
+          description: |
+            Устойчивый идентификатор. Не счётчик: выводится из пары
+            (машина, цель), иначе перезапуск отвязал бы инцидент от машины,
+            а повторный приход в красную зону создал бы второй
+            идентификатор на тот же простой. Возвращение в красную зону
+            добавляет суффикс эпизода
+          example: 6d8c8758d515e8b5-1
+        unit_id: { type: integer, format: int64 }
+        tr_id: { type: integer, format: int64 }
+        target_stop_id: { type: integer, format: int64 }
+        status:
+          type: string
+          enum: [open, acked, resolved]
+          description: |
+            `open` — машина в красной зоне, `acked` — взято в работу,
+            `resolved` — риск ушёл из красной зоны. Жёлтый прогноз инцидента
+            не создаёт: он существует затем, чтобы оператор увидел тревожный
+            прогноз ДО того, как он стал простоем
+        risk: { $ref: "#/components/schemas/Risk" }
+        opened_at:
+          type: string
+          format: date-time
+          description: Когда машина впервые попала в красную зону
+        updated_at:
+          type: string
+          format: date-time
+          description: Когда прогноз обновляли в последний раз
+        acked_at:
+          type: string
+          format: date-time
+          nullable: true
+        acked_by:
+          type: string
+          description: Пусто, если не брали
+        resolved_at:
+          type: string
+          format: date-time
+          nullable: true
+        predicted_dev_s:
+          type: number
+          format: double
+          description: Значение, давшее красную зону
+        p_late: { type: number, format: double, minimum: 0, maximum: 1 }
+        stale:
+          type: boolean
+          description: Прогноз, на котором стоит инцидент, устарел
+        source: { $ref: "#/components/schemas/Source" }
+
+    PredictRequest:
+      type: object
+      required: [sample_id, unit_id, tr_id, target_stop_id, features]
+      properties:
+        sample_id:
+          type: string
+          description: "<tr_id>_<unix(T)> с округлением T вниз до сетки 300 с"
+        unit_id: { type: integer, format: int64, minimum: 1 }
+        tr_id: { type: integer, format: int64 }
+        t:
+          type: string
+          format: date-time
+          description: Время, к которому относятся признаки
+        target_stop_id: { type: integer, format: int64 }
+        target_ambiguous:
+          type: boolean
+          description: |
+            Выбрать остановку не удалось и была взята ближайшая. Признак
+            доходит до модели, а не подменяется молча
+        features:
+          type: object
+          description: |
+            Признаки кадра. Имена сверяются с контрактом модели, опечатка
+            даёт 400. Пропуск — это `null`, а не отсутствие ключа: иначе
+            через API вернулся бы ровно тот дефект, который чинили в
+            конвейере, где пропуск был неотличим от «не измеряли».
+          additionalProperties:
+            type: number
+            nullable: true
+          example:
+            cur_dev_s: 45.2
+            horizon_s: 600
+            route_progress: 0.41
+            drift_last3_slope: null

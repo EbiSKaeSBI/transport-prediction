@@ -185,6 +185,19 @@ func expectDisconnect(t *testing.T, h *captureHandler) uint32 {
 	}
 }
 
+// waitActiveConns ждёт нужного числа активных соединений.
+func waitActiveConns(t *testing.T, ts *testServer, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if ts.Metrics.Snapshot().ActiveConns == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("ActiveConns %d, ожидалось %d", ts.Metrics.Snapshot().ActiveConns, want)
+}
+
 func buildRealtimeFrame(t *testing.T, peerAddress uint32, nav ndtp.Nav00) []byte {
 	t.Helper()
 	body := make([]byte, 2+ndtp.SizeNav00)
@@ -503,9 +516,12 @@ func TestServerDisconnect(t *testing.T) {
 	conn.Close()
 	expectDisconnect(t, handler)
 
-	if snap := ts.Metrics.Snapshot(); snap.ActiveConns != 0 {
-		t.Errorf("ActiveConns %d после закрытия, ожидалось 0", snap.ActiveConns)
-	}
+	// Счётчик ждём, а не читаем сразу: отложенные функции handle
+	// выполняются в обратном порядке, поэтому OnDisconnect, на котором
+	// синхронизируется expectDisconnect, срабатывает раньше уменьшения
+	// ActiveConns. Проверка без ожидания была гонкой и падала примерно в
+	// одном прогоне из пяти.
+	waitActiveConns(t, ts, 0)
 	if snap := ts.Metrics.Snapshot(); snap.CRCErrors != 0 || snap.DecodeErrors != 0 {
 		t.Errorf("штатное отключение не должно считаться ошибкой: CRC=%d Decode=%d",
 			snap.CRCErrors, snap.DecodeErrors)

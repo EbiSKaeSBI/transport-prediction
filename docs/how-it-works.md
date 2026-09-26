@@ -17,10 +17,13 @@
 офлайн — на исторических CSV. Это единственный способ исключить расхождение
 между обучением и эксплуатацией конструктивно, а не аккуратностью разработчика.
 
-> **Статус: пакет `features` и команда `transportctl replay` ещё не
-> реализованы.** Схема ниже показывает целевую архитектуру. На текущий момент
-> работает только контур приёма NDTP (`serve`, `ndtp-capture`, `ndtp-inspect`),
-> и никакие признаки ни онлайн, ни офлайн не считаются.
+> **Статус: реализованы `backend/internal/features`, `horizon` и команда
+> `transportctl replay` (выход — JSONL-кадры, не parquet), а также ML-пакет
+> `ml/src/predictor` (dataset/train/predict, ватерлайн v1b — MAE оракула
+> 58.2 с на validate).** Контур приёма NDTP (`serve`, `ndtp-capture`,
+> `ndtp-inspect`) работает. Не реализованы пока: gRPC-сервис предсказаний
+> (#26) и дашборд-рассылка.
+> Схема ниже — целевая архитектура.
 
 ```
                       FEATURE CONTRACT v1  (features/v1.yaml)
@@ -161,7 +164,10 @@ T + 10 мин  <  time_begin  ≤  T + 15 мин
 
 **Инвариант критерия 2:** инцидент не создаётся, если
 `target_time_begin − T ∉ (600; 900]` секунд. Отдельный тест проверяет, что ни один
-алерт не формируется «задним числом». Демо — `TICK=30s`, продакшен — `TICK=5m`.
+алерт не формируется «задним числом». Тик (`--tick`, по умолчанию 15 с) проверяет
+наступление границы; считает моменты прогноза сетка в пять минут (`--grid`),
+округляя `T` вниз. Тик 15 с при сетке в 5 минут даёт 20 проверок на одну ячейку,
+и кадр строится на первой.
 
 ### 2.7. Сбор признаков
 
@@ -188,16 +194,30 @@ neighbor_speed_on_segment
 ### 2.8. Запрос в ML Core
 
 ```
-Go → Python  (gRPC, 12 мс)
-  Predict(FeatureFrame + окно из 92 точек)
+Go → Python  POST /predict  (HTTP + JSON)
+  { sample_id, unit_id, tr_id, t, target_stop_id, horizon_s,
+    target_ambiguous, features {21 признак} }
 
 Python → Go
-  { delay_s: 96, p_late: 0.31, p_ontime: 0.58, p_early: 0.11,
-    reason: "schedule_slack", horizon_min: 15, model_version: "v3" }
+  { delta_s: 96, p_late: 0.31, model_version: "v3" }
 ```
 
-Таймаут 300 мс, 2 ретрая с backoff, circuit breaker. При недоступности ML — последний
-известный прогноз с флагом `prediction_stale`, затем fallback на `pred = cur_dev_s`.
+Имена 21 признака едут вместе с кадром, и модель сверяет их со своим
+контрактом: расхождение обязано падать, а не предупреждать.
+
+Таймаут, ретраи с backoff, circuit breaker. При недоступности ML — последний
+известный прогноз модели с флагом устаревания и его исходным `as_of`, затем
+baseline: `delta_s = 0`, то есть `pred = cur_dev_s`.
+
+Между конвейером и моделью стоит ограниченная очередь: недоступность ML не
+должна останавливать приём телеметрии. Отброшенные кадры считаются и видны в
+сводке и в `/metrics`.
+
+Кадры, дошедшие до воркера на одной границе сетки, уходят одним запросом:
+`POST /predict/batch` с массивом `frames` вместо последовательности одиночных
+запросов. Ответы приходят вразнобой и сопоставляются по `sample_id`; если
+модель ответила ошибкой, пачка разворачивается в поштучный обход, чтобы
+кадры не пропали. Утверждения об этом — в ADR 0009.
 
 ### 2.9. Решение об инциденте
 
@@ -267,35 +287,42 @@ Go пишет прогноз в Postgres и рассылает событие п
 
 ## 4. OFFLINE: как делается сабмит
 
-> **Статус: конвейер признаков ещё не реализован.** Сейчас доступны только
-> шаги 4 и 5 в урезанном виде; офлайн-признаки считает скрипт на Python, а не
-> тот же Go-код, что работает в онлайне. Ниже планируемая последовательность.
+> **Статус: шаги 1–5 конвейера реализованы** (2026-09-25, ветка
+> `feature/phase3-ml`): офлайн-признаки считает тот же Go-код, что онлайн
+> (`transportctl replay`), модель и инференс — `ml/src/predictor`.
+> Отличия от целевой схемы: шаг 1/3 — выход JSONL вместо parquet
+> (`predictor.dataset` конвертирует его в датасет-паркиеты с python-секциями
+> window/context), шаг 2 — таргет пока абсолютный `target_delay_s`
+> (дельта `target − cur_dev` — задача #25), шаг 5 — режим `--model` работает,
+> финальная перегенерация корневого `submission.csv` — задача #27.
+> Последовательность:
 
 ```
-1. transportctl replay --input train/            [планируется]
-   читает train/traffic.csv + train/schedule.csv + labels_train.csv
-   → features.parquet          (те же признаки, что в онлайне — тот же Go-код)
+1. transportctl replay -plan train/schedule.csv -traffic train/traffic.csv
+     -labels labels/labels_train.csv -out ml/artifacts/features_train.jsonl
+   + python -m predictor.dataset → dataset_train.parquet
+     (те же Go-признаки, что в онлайне + python-секции as-of T)
 
 2. python -m predictor.train
    polars → CatBoostRegressor(loss="MAE")
-   таргет = target_delay_s − cur_dev_s
-   метрика на labels_test.csv: MAE
-   → model.json + feature_schema.json
+   таргет = target_delay_s (v1/v2) → target_delay_s − cur_dev_s (#25)
+   метрика: MAE на dataset_test (holdout) + oracle_audit --predictions
+   → model_v1b.json + metrics_v1b.json (список фич и важности в нём)
 
-3. transportctl replay --input validate/         [планируется]
-   → features.parquet
+3. transportctl replay -labels validate/points.csv -out ... + predictor.dataset
+   → dataset_validate.parquet (142 кадра; cur_dev_s — хинт, ADR-0004)
 
-4. predictor.infer --batch → predictions
-   delay = cur_dev_s + model.predict(features)
+4. python -m predictor.predict --dataset dataset_validate.parquet
+   → predictions_validate.csv (sample_id;prediction)
 
-5. python scripts/make_submission.py
+5. python scripts/make_submission.py --model predictions_validate.csv
    → submission.csv   (sample_id;prediction, разделитель «;», все 151 строка)
 ```
 
-Реализовано на данный момент: `python scripts/make_submission.py` (шаг 5) и
-`python scripts/oracle_audit.py` — аудит, отдельно подтверждающий, что
-`test/` и `validate/` содержат одни и те же данные, поэтому метрики на них
-нельзя считать независимыми.
+Аудит: `python scripts/oracle_audit.py` — подтверждает, что `test/` и
+`validate/` содержат одни и те же данные (метрики на них нельзя считать
+независимыми), и умеет скорить произвольные предсказания:
+`--predictions FILE` (apple-to-apple на общей выборке).
 
 Ключевое требование к шагам 1 и 3: они должны вызывать тот же код, что
 работает в онлайне. Иначе офлайн-метрика ничего не говорит о качестве

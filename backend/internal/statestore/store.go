@@ -344,6 +344,60 @@ func (s *Store) State(unitID uint32) (State, bool) {
 	}, true
 }
 
+// StateAsOf возвращает состояние машины таким, каким оно было в момент at.
+//
+// Отдельный метод, а не аргумент у State, потому что это другой вопрос.
+// State отвечает на «что машина делает сейчас», и для планирования с T на
+// сетке он даёт неправильный ответ: он смотрит на телеметрию, пришедшую уже
+// после T, и кадр, подписанный T, получает данные из будущего. Это тот самый
+// класс утечки, который лечит ADR 0004, поэтому граница проходит по at с
+// обеих сторон — по времени события и по времени приёма.
+//
+// Устаревание здесь считается от at, а не от текущего момента: отвечает на
+// вопрос «насколько машина была молча к T», и только этот вопрос имеет
+// смысл для кадра с этим T.
+func (s *Store) StateAsOf(unitID uint32, at time.Time) (State, bool) {
+	sh := s.shardFor(unitID)
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	v, ok := sh.units[unitID]
+	if !ok {
+		return State{}, false
+	}
+	// Точки не позже at по обеим меткам: пакет с меткой события из будущего,
+	// пришедший вовремя, в кадр с этим T не попадает. Пропуск такого пакета
+	// обязателен и для паритета: offline stateAt обрывает историю по
+	// EventTime > t, и «последняя по приёму» против «последняя по событию»
+	// разошлись бы ровно на часах с перекосом.
+	points := v.buf.since(at)
+	kept := points[:0:0]
+	for _, p := range points {
+		if !p.EventTime.After(at) {
+			kept = append(kept, p)
+		}
+	}
+	points = kept
+	if len(points) == 0 {
+		return State{}, false
+	}
+	if len(points) > 1 {
+		slices.SortStableFunc(points, func(a, b Point) int {
+			return a.EventTime.Compare(b.EventTime)
+		})
+	}
+	// Состояние — точка с наибольшим временем события: машина ехала дальше
+	// всех, даже если пакет пришёл позже более раннего по времени события.
+	last := points[len(points)-1]
+	staleness := at.Sub(last.ReceiveTime)
+	return State{
+		Point:          last,
+		SeenAt:         last.ReceiveTime,
+		StalenessS:     staleness.Seconds(),
+		Stale:          staleness > s.staleAfter,
+		PointsInWindow: len(points),
+	}, true
+}
+
 // Units возвращает отсортированный список устройств с историей.
 func (s *Store) Units() []uint32 {
 	units := make([]uint32, 0, 16)

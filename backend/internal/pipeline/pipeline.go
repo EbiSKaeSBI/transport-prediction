@@ -31,6 +31,15 @@ const (
 	// больше горизонта: признак перерыва требует следующей остановки, а
 	// выбор цели — только строки до T+15 минут.
 	RouteWindowAfter = 40 * time.Minute
+
+	// DefaultGrid — шаг сетки моментов прогноза.
+	//
+	// Пять минут — не округление на глаз. Модель обучалась на выборке, где
+	// T лежит на сетке, и кадр с произвольным T не имеет с ней ничего
+	// общего. Сетка нужна ещё и для того, чтобы вызовы модели шли пачками с
+	// одинаковым T: батч из тридцати машин с одним временем обучаем, а три
+	//дцать разных времён — нет.
+	DefaultGrid = 5 * time.Minute
 )
 
 // Sink принимает готовые кадры прогноза.
@@ -53,6 +62,10 @@ type Config struct {
 	Planner *horizon.Planner
 	// Sink — получатель кадров. При nil кадры только считаются.
 	Sink Sink
+	// Grid — шаг сетки моментов прогноза. Ноль берётся как DefaultGrid.
+	// Момент T округляется вниз до кратного Grid, а кадры считаются только
+	// на границе ячейки. Причина в docs/adr/0007.
+	Grid time.Duration
 	// Observer — разборщик NDTP-пакетов. При nil создаётся без вывода.
 	Observer *telemetry.Observer
 	// Logger — журнал. При nil используется slog.Default.
@@ -75,6 +88,12 @@ type Stats struct {
 	// привязки. Ненулевое значение означает, что процесс живёт, но не
 	// прогнозирует, и это обязано быть видно в сводке.
 	NoPlan int64
+	// NoStateAtT — тактиров, где на момент T у машины не было ни одного
+	// пакета. Обычно это машина, включившаяся посреди ячейки сетки: до
+	// границы у неё нет данных, и подставлять более поздние значило бы
+	// предсказать по будущему. Отдельный счётчик, потому что молчаливый
+	// отказ выглядел бы как «машина спит», а это не так.
+	NoStateAtT int64
 	// Refused — отказов планировщика с причиной.
 	Refused map[string]int64
 }
@@ -91,7 +110,11 @@ type Pipeline struct {
 	// устройствам. Один инцидент на пару «машина, остановка»: повторная
 	// отправка каждую секунду забила бы очередь прогнозов.
 	lastTarget map[uint32]int64
-	stats      Stats
+	// lastGrid — начало последней спланированной ячейки сетки. Нулевое
+	// значение означает, что не спланировано ещё ничего, и первый тик
+	// поэтому считается, даже если процесс поднялся посреди ячейки.
+	lastGrid time.Time
+	stats    Stats
 }
 
 // New создаёт конвейер. Обязателен только Store: без него конвейер не
@@ -114,6 +137,9 @@ func New(cfg Config) (*Pipeline, error) {
 	if cfg.Schedule == nil || cfg.Binding == nil {
 		logger.Warn("конвейер без расписания: телеметрия принимается, прогноз не строится",
 			"schedule", cfg.Schedule == nil, "binding", cfg.Binding == nil)
+	}
+	if cfg.Grid <= 0 {
+		cfg.Grid = DefaultGrid
 	}
 	planner := cfg.Planner
 	if planner == nil {
@@ -170,20 +196,54 @@ func (p *Pipeline) OnDisconnect(unitID uint32) {
 	p.mu.Unlock()
 }
 
-// Tick строит кадры прогноза для всех известных устройств на момент now.
-// Метод вызывается по таймеру: прогноз — не следствие пакета, а решение,
-// принятое раз в несколько секунд, иначе один и тот же кадр уходил бы в
-// модель на каждой точке.
+// Tick строит кадры прогноза для всех известных устройств.
+//
+// Тик приходит каждые 15 секунд, а кадры считаются не на каждом тике, а один
+// раз на ячейку сетки: T округляется вниз до кратного сетки, и повторные тики
+// внутри одной ячейки не делают ничего. Это не оптимизация, а требование
+// контракта: модель обучалась на выборке с T на сетке, и кадры с
+// произвольным T не имеют с ней ничего общего.
+//
+// Данные для кадра берутся строго не позже T, а не «как есть на момент
+// тика». Иначе кадр, подписанный 08:05, получил бы состояние машины от
+// 08:07 — это утечка из будущего, ровно та, которую лечит ADR 0004. Цена
+// решения видима: машина, включившаяся посреди ячейки, получит первый
+// прогноз только на её границе.
 func (p *Pipeline) Tick(ctx context.Context, now time.Time) {
 	if err := ctx.Err(); err != nil {
+		return
+	}
+	gridT := now.Truncate(p.cfg.Grid)
+	if !p.claimGrid(gridT) {
 		return
 	}
 	for _, unitID := range p.cfg.Store.Units() {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		p.planUnit(ctx, unitID, now)
+		p.planUnit(ctx, unitID, gridT)
 	}
+}
+
+// claimGrid отмечает ячейку как спланированную и сообщает, стоит ли её
+// считать. Планируется ровно одна ячейка за раз: тик внутри той же ячейки
+// делать нечего, а тик назад по времени после перезапуска не должен
+// пересчитывать уже посчитанное.
+func (p *Pipeline) claimGrid(gridT time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.lastGrid.IsZero() && !gridT.After(p.lastGrid) {
+		return false
+	}
+	p.lastGrid = gridT
+	return true
+}
+
+// Grid возвращает начало последней спланированной ячейки.
+func (p *Pipeline) Grid() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastGrid
 }
 
 // Run тикает с заданным интервалом до отмены контекста.
@@ -203,8 +263,8 @@ func (p *Pipeline) Run(ctx context.Context, every time.Duration) {
 	}
 }
 
-// planUnit строит кадр для одного устройства.
-func (p *Pipeline) planUnit(ctx context.Context, unitID uint32, now time.Time) {
+// planUnit строит кадр для одного устройства на момент t.
+func (p *Pipeline) planUnit(ctx context.Context, unitID uint32, t time.Time) {
 	if p.cfg.Schedule == nil || p.cfg.Binding == nil {
 		p.mu.Lock()
 		p.stats.NoPlan++
@@ -218,11 +278,18 @@ func (p *Pipeline) planUnit(ctx context.Context, unitID uint32, now time.Time) {
 		p.mu.Unlock()
 		return
 	}
-	state, hasState := p.cfg.Store.State(unitID)
+	// Состояние и история берутся на момент t, а не «последние известные».
+	// Тик может прийти через несколько секунд после начала ячейки, и к тому
+	// моменту в хранилище есть пакеты с временем события после t: подставить
+	// их в кадр с этим t значит предсказать по данным из будущего.
+	state, hasState := p.cfg.Store.StateAsOf(unitID, t)
 	if !hasState {
+		p.mu.Lock()
+		p.stats.NoStateAtT++
+		p.mu.Unlock()
 		return
 	}
-	window := p.cfg.Schedule.Window(trID, now.Add(-RouteWindowBefore), now.Add(RouteWindowAfter))
+	window := p.cfg.Schedule.Window(trID, t.Add(-RouteWindowBefore), t.Add(RouteWindowAfter))
 	if len(window) == 0 {
 		p.mu.Lock()
 		p.stats.NoSchedule++
@@ -231,7 +298,7 @@ func (p *Pipeline) planUnit(ctx context.Context, unitID uint32, now time.Time) {
 	}
 
 	decision := p.planner.Plan(horizon.Request{
-		T:        now,
+		T:        t,
 		TRID:     trID,
 		UnitID:   unitID,
 		Stops:    window,
@@ -306,6 +373,7 @@ func (p *Pipeline) Stats() Stats {
 		NoBinding:    p.stats.NoBinding,
 		NoSchedule:   p.stats.NoSchedule,
 		NoPlan:       p.stats.NoPlan,
+		NoStateAtT:   p.stats.NoStateAtT,
 		Refused:      make(map[string]int64, len(p.stats.Refused)),
 	}
 	for reason, n := range p.stats.Refused {

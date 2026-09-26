@@ -12,10 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/gateway"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/horizon"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/latency"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/ndtpserver"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/pipeline"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/predictor"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/schedule"
+	"github.com/ebiskauesbi/transport-prediction/backend/internal/scheduler"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/statestore"
 	"github.com/ebiskauesbi/transport-prediction/backend/internal/telemetry"
 )
@@ -23,10 +27,15 @@ import (
 // defaultJSONLPath — путь к JSONL-файлу наблюдений по умолчанию.
 const defaultJSONLPath = "observations.jsonl"
 
-// frameLogger — заглушка приёмника кадров до появления клиента модели. Кадры
-// считаются и логируются, но никуда не отправляются, чтобы прогноз не
-// выглядел работающим, пока его некому предъявить.
+// frameLogger — приёмник кадров, который пишет их в журнал и передаёт
+// дальше.
+//
+// Внутренний приёмник не обязателен: в --dry-run кадры только пишутся, и
+// прогноз не должен выглядеть работающим, пока его некому предъявить. С
+// моделью и гейтвеем inner обязателен, и тогда журнал перестаёт быть
+// единственным, кто видел кадр.
 type frameLogger struct {
+	inner   pipeline.Sink
 	logger  *slog.Logger
 	verbose bool
 }
@@ -44,6 +53,9 @@ func (f *frameLogger) Submit(frame horizon.Frame) {
 		"ambiguous", frame.Ambiguous,
 		"horizon_s", frame.HorizonS(),
 		"признаков", len(frame.Values))
+	if f.inner != nil {
+		f.inner.Submit(frame)
+	}
 }
 
 func runServe(args []string) error {
@@ -56,8 +68,14 @@ func runServe(args []string) error {
 	statsEvery := fs.Duration("stats", 30*time.Second, "как часто печатать сводку (0 — не печатать)")
 	planPath := fs.String("plan", "", "CSV планового графика (обязателен для прогноза)")
 	bindingPath := fs.String("binding", "", "CSV соответствия tr_id и unit_id (обязателен)")
-	tickEvery := fs.Duration("tick", 15*time.Second, "как часто строить прогноз")
+	tickEvery := fs.Duration("tick", 15*time.Second, "как часто проверять наступление границы ячейки")
+	gridEvery := fs.Duration("grid", pipeline.DefaultGrid, "шаг сетки моментов прогноза")
 	dryRun := fs.Bool("dry-run", false, "не строить прогноз: только принимать и хранить телеметрию")
+	httpAddr := fs.String("http", ":8080", "адрес HTTP-гейтвея (пусто — не поднимать)")
+	mlURL := fs.String("ml", "", "адрес сервиса модели (пусто — только baseline)")
+	mlTimeout := fs.Duration("ml-timeout", 0, "бюджет одной попытки модели (0 — умолчание)")
+	queueSize := fs.Int("queue", scheduler.DefaultQueue, "размер очереди прогнозов")
+	batchSize := fs.Int("batch", scheduler.DefaultBatch, "сколько кадров уходит в модель одним запросом (1 — поштучно)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -91,7 +109,10 @@ func runServe(args []string) error {
 		Store:    store,
 		Observer: observer,
 		Logger:   logger,
-		Sink:     &frameLogger{logger: logger, verbose: *verbose},
+		Grid:     *gridEvery,
+	}
+	if *gridEvery <= 0 {
+		return fmt.Errorf("--grid должен быть положительным, иначе моменты прогноза не сетятся")
 	}
 	if *dryRun {
 		logger.Info("режим --dry-run: телеметрия принимается и копится, прогноз не строится",
@@ -115,10 +136,21 @@ func runServe(args []string) error {
 			"остановок", plan.StopsCount(), "единиц", binding.Len())
 	}
 
-	pipe, err := pipeline.New(cfg)
+	pred := predictorChain(*mlURL, *mlTimeout, logger)
+	service, err := buildService(serviceOptions{
+		Pipeline:  cfg,
+		Predictor: pred,
+		Queue:     *queueSize,
+		Batch:     *batchSize,
+		HTTPAddr:  *httpAddr,
+		DryRun:    *dryRun,
+		Verbose:   *verbose,
+		Logger:    logger,
+	})
 	if err != nil {
 		return err
 	}
+	pipe, sched, gw, hub := service.Pipeline, service.Scheduler, service.Gateway, service.Hub
 
 	server := &ndtpserver.Server{
 		Addr:    *listen,
@@ -139,10 +171,21 @@ func runServe(args []string) error {
 
 	if !*dryRun && *tickEvery > 0 {
 		go pipe.Run(ctx, *tickEvery)
+		go sched.Run(ctx)
+		go hub.Run(ctx)
+	}
+
+	if *httpAddr != "" && gw != nil {
+		go func() {
+			if err := gw.ListenAndServe(ctx); err != nil {
+				logger.Error("HTTP-гейтвей остановился", "err", err)
+			}
+		}()
 	}
 
 	if *statsEvery > 0 {
-		go reportStats(ctx, listener.Addr().String(), observer, server, pipe, logger, *statsEvery)
+		go reportStats(ctx, listener.Addr().String(), observer, server, pipe, sched,
+			logger, *statsEvery)
 	}
 
 	if err := server.Serve(listener, ctx); err != nil {
@@ -152,8 +195,138 @@ func runServe(args []string) error {
 	return nil
 }
 
+// serviceOptions — вход сборки сервиса.
+type serviceOptions struct {
+	// Pipeline — конфигурация конвейера без приёмника кадров: его подставляет
+	// сборка, потому что кадры уходят в планировщик, а не в журнал.
+	Pipeline  pipeline.Config
+	Predictor predictor.Predictor
+	Queue     int
+	Batch     int
+	HTTPAddr  string
+	DryRun    bool
+	Verbose   bool
+	Logger    *slog.Logger
+}
+
+// service — собранный сервис: конвейер, планировщик, гейтвей и лента.
+type service struct {
+	Pipeline  *pipeline.Pipeline
+	Scheduler *scheduler.Scheduler
+	Gateway   *gateway.Server
+	Hub       *gateway.Hub
+}
+
+// buildService собирает конвейер, планировщик прогнозов, гейтвей и ленту
+// событий.
+//
+// Отдельная функция, а не код внутри runServe, потому что связка между ними —
+// место, где легче всего тихо потерять звено: кадры уйдут в никуда, прогнозов
+// не будет, а процесс будет работать и показывать зелёное ready. Сборка
+// проверяется тестом целиком, включая HTTP-ответ гейтвея.
+func buildService(opts serviceOptions) (*service, error) {
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	// Лента получает метрики от гейтвея, а гейтвей получает ленту в
+	// конструктор, поэтому метрики читаются через замыкание по переменной:
+	// к моменту первого тика ленты гейтвей уже собран.
+	var gw *gateway.Server
+	hub := gateway.NewHub(gateway.HubConfig{
+		MetricsProvider: func() any {
+			if gw == nil {
+				return nil
+			}
+			return gw.Snapshot()
+		},
+	})
+
+	sched := scheduler.New(scheduler.Config{
+		Predictor: opts.Predictor,
+		Queue:     opts.Queue,
+		Batch:     opts.Batch,
+		Observer: func(p predictor.Prediction) {
+			gw.Observe(p)
+		},
+		Logger: logger,
+	})
+	if !opts.DryRun {
+		gw = gateway.New(gateway.Config{
+			Addr:      opts.HTTPAddr,
+			Store:     opts.Pipeline.Store,
+			Schedule:  opts.Pipeline.Schedule,
+			Binding:   opts.Pipeline.Binding,
+			Predictor: opts.Predictor,
+			Hub:       hub,
+			// Метрики очереди и инференции читаются через замыкания: к
+			// моменту чтения планировщик уже собран, а гейтвей не должен
+			// знать, кто перед ним стоит.
+			Queue: func() gateway.QueueStats {
+				st := sched.Stats()
+				return gateway.QueueStats{
+					Depth:         sched.QueueLen(),
+					Submitted:     st.Submitted,
+					Predicted:     st.Predicted,
+					Dropped:       st.Dropped,
+					Abandoned:     st.Abandoned,
+					Batches:       st.Batches,
+					BatchedFrames: st.BatchedFrames,
+					BatchSize:     sched.BatchSizeQuantiles(),
+				}
+			},
+			Inference: inferenceWindow(opts.Predictor),
+			Logger:    logger,
+		})
+	}
+
+	// В --dry-run кадры только пишутся в журнал: предъявлять их некуда, и
+	// выдавать пустую очередь за работающий прогноз нельзя.
+	var sink pipeline.Sink = &frameLogger{logger: logger, verbose: opts.Verbose}
+	if gw != nil {
+		sink = &frameLogger{inner: sched, logger: logger, verbose: opts.Verbose}
+	}
+	cfg := opts.Pipeline
+	cfg.Sink = sink
+
+	pipe, err := pipeline.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &service{Pipeline: pipe, Scheduler: sched, Gateway: gw, Hub: hub}, nil
+}
+
+// predictorChain собирает цепочку прогноза: модель, а под ней baseline.
+//
+// Модели может не быть — тогда baseline отвечает всегда, и это штатный
+// режим, а не поломка: сервер на площадке поднимают раньше, чем появится
+// сервис модели. Отдельная функция, а не код внутри runServe, потому что
+// состав цепочки — это контракт с ML-разработчиком, и он обязан быть
+// проверяемым тестом, а не чтением флага.
+func predictorChain(mlURL string, timeout time.Duration, logger *slog.Logger) predictor.Predictor {
+	if mlURL == "" {
+		logger.Info("модель не задана: прогноз отдаёт baseline, то есть cur_dev_s без добавки",
+			"подсказка", "перезапустите с --ml http://адрес:порт, когда сервис модели будет доступен")
+		return predictor.BaselinePredictor{}
+	}
+	logger.Info("модель подключена", "адрес", mlURL, "таймаут", timeout)
+	pred := predictor.NewMLClient(predictor.MLConfig{BaseURL: mlURL, Timeout: timeout})
+	return predictor.NewFallback(pred, predictor.BaselinePredictor{}, 0)
+}
+
+// inferenceWindow достаёт окно замеров у настроенной цепочки прогноза.
+// Отсутствие окна — не поломка: цепочка без модели (baseline) замерять
+// инференцию не может, и метрики просто не публикуются.
+func inferenceWindow(p predictor.Predictor) func() latency.Quantiles {
+	if w, ok := p.(predictor.InferenceWindow); ok {
+		return w.Inference
+	}
+	return nil
+}
+
 func reportStats(ctx context.Context, addr string, observer *telemetry.Observer,
-	server *ndtpserver.Server, pipe *pipeline.Pipeline, logger *slog.Logger, every time.Duration) {
+	server *ndtpserver.Server, pipe *pipeline.Pipeline, sched *scheduler.Scheduler,
+	logger *slog.Logger, every time.Duration) {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -166,6 +339,7 @@ func reportStats(ctx context.Context, addr string, observer *telemetry.Observer,
 			units := observer.Units()
 			sort.Slice(units, func(i, j int) bool { return units[i] < units[j] })
 			forecast := pipe.Stats()
+			queue := sched.Stats()
 			logger.Info("сводка",
 				"addr", addr,
 				"устройств", len(units),
@@ -183,7 +357,17 @@ func reportStats(ctx context.Context, addr string, observer *telemetry.Observer,
 				"кадров", forecast.Frames,
 				"повторов", forecast.Deduped,
 				"без_привязки", forecast.NoBinding,
-				"без_окна", forecast.NoSchedule)
+				"без_окна", forecast.NoSchedule,
+				"без_данных_на_T", forecast.NoStateAtT,
+				"в_очереди", queue.BySource,
+				"ждёт_модели", sched.QueueLen(),
+				"предсказано", queue.Predicted,
+				"отброшено", queue.Dropped,
+				"батчей", queue.Batches,
+				// Медиана размера пачки показывает, батчинг ли вообще
+				// работает: при батче по одному кадру медиана равна единице,
+				// и это читается сразу, без сравнения счётчиков.
+				"кадров_в_батче", sched.BatchSizeQuantiles().P50)
 		}
 	}
 }

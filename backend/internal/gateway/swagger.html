@@ -1,0 +1,274 @@
+<!doctype html>
+<!--
+  Страница описания API. Намеренно без единого внешнего адреса: приборная
+  панель часто стоит в контуре, где CDN не разрешён, и страница, которая без
+  сети не открывается, там бесполезна. Вместо тяжёлого просмотрщика — разбор
+  тех строк спецификации, из которых нужен индекс, и форма ответа.
+-->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Гейтвей прогнозов — API</title>
+<style>
+  :root {
+    --bg: #10151c;
+    --panel: #171e27;
+    --line: #27313d;
+    --text: #dde4ec;
+    --dim: #8a97a6;
+    --get: #4f9d5b;
+    --post: #b8860b;
+    --err: #c0504d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0 0 4rem;
+    background: var(--bg); color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 1.6rem 1.5rem 1.2rem; border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  h1 { margin: 0 0 .4rem; font-size: 1.3rem; font-weight: 600; }
+  main { max-width: 68rem; margin: 0 auto; padding: 0 1.5rem; }
+  p.lede { margin: 0; color: var(--dim); max-width: 46rem; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+             margin: 1.2rem 0; }
+  label { color: var(--dim); font-size: .9rem; }
+  input[type=text] {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px;
+    padding: .45rem .6rem; min-width: 22rem; font: inherit;
+  }
+  button {
+    background: #22303f; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: .45rem .8rem; font: inherit; cursor: pointer;
+  }
+  button:hover { background: #2b3c4f; }
+  a { color: #6aa9d8; }
+  h2 { font-size: 1rem; margin: 2rem 0 .6rem; color: var(--dim);
+       text-transform: uppercase; letter-spacing: .06em; }
+  .ep { border: 1px solid var(--line); border-radius: 8px; margin-bottom: .7rem;
+        background: var(--panel); overflow: hidden; }
+  .ep > summary { cursor: pointer; padding: .6rem .8rem; display: flex;
+                   gap: .7rem; align-items: baseline; list-style: none; }
+  .ep > summary::-webkit-details-marker { display: none; }
+  .m { font: 600 .78rem ui-monospace, Menlo, Consolas, monospace;
+       padding: .12rem .45rem; border-radius: 4px; flex: none; }
+  .m.get { color: #0d1f12; background: var(--get); }
+  .m.post { color: #1a1400; background: var(--post); }
+  .path { font: .9rem ui-monospace, Menlo, Consolas, monospace; }
+  .sum { color: var(--dim); }
+  .body { padding: 0 .9rem .9rem; border-top: 1px solid var(--line);
+          margin-top: .1rem; padding-top: .8rem; }
+  pre { background: #0c1116; border: 1px solid var(--line); border-radius: 6px;
+        padding: .7rem; overflow-x: auto; margin: .5rem 0;
+        font: .82rem/1.5 ui-monospace, Menlo, Consolas, monospace; }
+  .desc { color: var(--dim); margin: 0 0 .6rem; }
+  .warn { color: var(--err); }
+  footer { margin-top: 2.5rem; color: var(--dim); font-size: .85rem; }
+</style>
+</head>
+<body>
+<header>
+  <main style="padding:0">
+    <h1>Гейтвей прогнозов — API</h1>
+    <p class="lede">
+      Описание отдаётся тем же процессом, что и данные. Страница работает
+      без интернета: внешних адресов здесь нет ни одного, спецификация
+      забирается с этого же хоста.
+    </p>
+  </main>
+</header>
+
+<main>
+  <div class="toolbar">
+    <label for="base">Адрес гейтвея</label>
+    <input type="text" id="base" spellcheck="false">
+    <button id="reload">Обновить список</button>
+    <a href="openapi.yaml">Исходная спецификация</a>
+  </div>
+
+  <div id="status" class="desc">Загружаю спецификацию…</div>
+  <div id="list"></div>
+
+  <footer>
+    <p>
+      Лента <code>GET /ws/stream</code> в списке есть, но через эту страницу
+      не проверяется: это WebSocket, а не HTTP-запрос. Проверить его можно из
+      консоли браузера:
+    </p>
+    <pre>const ws = new WebSocket(`ws://${location.host}/ws/stream`);
+ws.onmessage = (e) => console.log(JSON.parse(e.data));</pre>
+    <p>
+      Запросы со страницы уходят тому гейтвею, что указан в поле адреса.
+      Не вставляйте туда адрес, который недоверенный: он получит все
+      ответы, а в режиме записи ещё и тело.
+    </p>
+  </footer>
+</main>
+
+<script>
+"use strict";
+
+// Разбор спецификации намеренно поверхностный: нужны только пути, методы и
+// первые строки описания. Полный разбор YAML потребовал бы парсера на
+// сотни килобайт ради индекса из пятнадцати строк, а исходная спецификация
+// всё равно доступна рядом целиком.
+function indexFromYaml(text) {
+  const out = [];
+  const lines = text.split("\n");
+  let inPaths = false;
+  let cur = null;
+  let collecting = false;
+
+  const flush = () => { if (cur && cur.path) out.push(cur); cur = null; };
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line.trim() || line.trim().startsWith("#")) { continue; }
+
+    if (/^[A-Za-z]/.test(line)) {          // верхний уровень: paths, components...
+      inPaths = line.startsWith("paths:");
+      continue;
+    }
+    if (!inPaths) { continue; }
+
+    let m = line.match(/^ {2}(\S+):\s*$/);                  // путь
+    if (m) {
+      flush();
+      cur = { path: m[1], method: "", summary: "", desc: [] };
+      continue;
+    }
+    m = line.match(/^ {4}(get|post|put|patch|delete):\s*$/);  // метод
+    if (m) { if (cur) cur.method = m[1].toUpperCase(); continue; }
+    m = line.match(/^ {6}summary:\s*(.+)$/);
+    if (m && cur) { cur.summary = m[1].replace(/^["']|["']$/g, ""); continue; }
+    if (cur && line.startsWith("      ")) {
+      cur.desc.push(line.trim());
+    }
+  }
+  flush();
+  return out;
+}
+
+const base = document.getElementById("base");
+const list = document.getElementById("list");
+const status = document.getElementById("status");
+
+function currentBase() {
+  return base.value.replace(/\/+$/, "");
+}
+
+function exampleFor(path) {
+  // {id} и {sample_id} в документе означают «подставьте своё», но для
+  // примера команды нужны настоящие значения.
+  return path.replace(/\{[^}]+\}/g, "1");
+}
+
+function curlFor(ep) {
+  const url = currentBase() + exampleFor(ep.path);
+  if (ep.method === "POST") {
+    return `curl -sS -X POST '${url}' \\\n` +
+           `  -H 'Content-Type: application/json' \\\n` +
+           `  -d '{"acked_by":"дежурный","note":"пример"}'`;
+  }
+  return `curl -sS '${url}'`;
+}
+
+function pretty(text) {
+  try { return JSON.stringify(JSON.parse(text), null, 2); }
+  catch (e) { return text; }
+}
+
+function send(ep, box) {
+  fetch(currentBase() + exampleFor(ep.path), { method: ep.method })
+    .then(async (r) => {
+      const body = await r.text();
+      box.textContent = r.status + " " + r.statusText + "\n\n" + pretty(body);
+    })
+    .catch((e) => { box.textContent = "Не удалось выполнить: " + e; });
+}
+
+function render(eps) {
+  list.textContent = "";
+  for (const ep of eps) {
+    const d = document.createElement("details");
+    d.className = "ep";
+
+    const head = document.createElement("summary");
+    const m = document.createElement("span");
+    m.className = "m " + ep.method.toLowerCase();
+    m.textContent = ep.method;
+    const p = document.createElement("span");
+    p.className = "path";
+    p.textContent = ep.path;
+    const s = document.createElement("span");
+    s.className = "sum";
+    s.textContent = ep.summary;
+    head.append(m, p, s);
+    d.append(head);
+
+    const body = document.createElement("div");
+    body.className = "body";
+
+    const desc = ep.desc.join(" ").replace(/\s+/g, " ").trim();
+    if (desc) {
+      const d0 = document.createElement("p");
+      d0.className = "desc";
+      d0.textContent = desc;
+      body.append(d0);
+    }
+
+    const pre = document.createElement("pre");
+    pre.textContent = curlFor(ep);
+    body.append(pre);
+
+    if (ep.method === "GET") {
+      const btn = document.createElement("button");
+      btn.textContent = "Выполнить";
+      const out = document.createElement("pre");
+      btn.addEventListener("click", () => send(ep, out));
+      body.append(btn, out);
+    } else {
+      const note = document.createElement("p");
+      note.className = "desc warn";
+      note.textContent =
+        "У этого метода есть тело, поэтому сначала скопируйте пример и " +
+        "отправьте его вручную.";
+      body.append(note);
+    }
+    d.append(body);
+    list.append(d);
+  }
+}
+
+function load() {
+  status.textContent = "Загружаю спецификацию…";
+  fetch("openapi.yaml")
+    .then((r) => {
+      if (!r.ok) { throw new Error(r.status + " " + r.statusText); }
+      return r.text();
+    })
+    .then((text) => {
+      const eps = indexFromYaml(text);
+      status.textContent = eps.length
+        ? eps.length + " эндпоинтов. Описания сокращены до первой строки; " +
+          "полная спецификация — по ссылке выше."
+        : "В спецификации не нашлось ни одного эндпоинта.";
+      render(eps);
+    })
+    .catch((e) => {
+      status.textContent = "Не удалось загрузить спецификацию: " + e;
+      list.textContent = "";
+    });
+}
+
+base.value = location.origin;
+document.getElementById("reload").addEventListener("click", load);
+load();
+</script>
+</body>
+</html>

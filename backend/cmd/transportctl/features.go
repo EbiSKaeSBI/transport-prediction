@@ -181,18 +181,22 @@ func historyAt(points []statestore.Point, t time.Time) []statestore.Point {
 }
 
 type frameJSON struct {
-	SampleID   string             `json:"sample_id"`
-	UnitID     uint32             `json:"unit_id"`
-	TRID       int64              `json:"tr_id"`
-	T          string             `json:"t"`
-	Target     int64              `json:"target_stop_id"`
-	HorizonS   float64            `json:"horizon_s"`
-	Ambiguous  bool               `json:"ambiguous"`
-	Variants   int                `json:"variants"`
-	Values     map[string]float64 `json:"values"`
-	StalenessS float64            `json:"staleness_s"`
-	Points     int32              `json:"points_in_window"`
-	LagS       float64            `json:"lag_s"`
+	SampleID  string  `json:"sample_id"`
+	UnitID    uint32  `json:"unit_id"`
+	TRID      int64   `json:"tr_id"`
+	T         string  `json:"t"`
+	Target    int64   `json:"target_stop_id"`
+	HorizonS  float64 `json:"horizon_s"`
+	Ambiguous bool    `json:"ambiguous"`
+	Variants  int     `json:"variants"`
+	// Values nullable по типам: признак, который не измерен, обязан приехать
+	// в JSON как null. Раньше такие ключи просто не попадали в карту, и
+	// выгрузка кадров теряла часть контракта — по ней нельзя было понять,
+	// отличается ли «не измерено» от «ноль».
+	Values     map[string]*float64 `json:"values"`
+	StalenessS float64             `json:"staleness_s"`
+	Points     int32               `json:"points_in_window"`
+	LagS       float64             `json:"lag_s"`
 }
 
 func writeFrame(w *lineWriter, f *horizon.Frame) error {

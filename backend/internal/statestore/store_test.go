@@ -275,3 +275,115 @@ func TestStoreUnitsSorted(t *testing.T) {
 		t.Errorf("Units %v, ожидалось %v", got, want)
 	}
 }
+
+// StateAsOf не должен видеть телеметрию, пришедшую после границы. Это ровно
+// тот случай, из-за которого метод и написан: кадр, подписанный T, не должен
+// считаться по данным, которых не было в T.
+func TestStateAsOfIgnoresFuturePoints(t *testing.T) {
+	store := New()
+	base := time.Date(2026, 1, 6, 8, 0, 0, 0, time.UTC)
+	for i, at := range []time.Duration{0, 9 * time.Second, 18 * time.Second, 27 * time.Second} {
+		store.Append(Point{
+			UnitID: 1, EventTime: base.Add(at), ReceiveTime: base.Add(at + time.Second),
+			SpeedKmh: float64(10 * (i + 1)),
+		})
+	}
+	// Граница в середине: пакет от 18 с виден, а 27 с — уже нет.
+	state, ok := store.StateAsOf(1, base.Add(20*time.Second))
+	if !ok {
+		t.Fatal("состояние на момент не найдено")
+	}
+	if got := state.Point.SpeedKmh; got != 30 {
+		t.Errorf("скорость %g, ожидалось 30: точка из будущего просочилась", got)
+	}
+	if state.PointsInWindow != 3 {
+		t.Errorf("в окне %d точек, ожидалось 3", state.PointsInWindow)
+	}
+	// Устаревание считается от границы, а не от текущего момента: отвечает
+	// на вопрос «насколько машина молчала к T».
+	if got := state.StalenessS; got < 0 || got > 3 {
+		t.Errorf("устаревание %g с, ожидалось 0..3", got)
+	}
+}
+
+// Точки без приёма к моменту не считаются, даже если время события подходит:
+// в T машина ещё не знала, что этот пакет придёт.
+func TestStateAsOfRespectsReceiveTime(t *testing.T) {
+	store := New()
+	base := time.Date(2026, 1, 6, 8, 0, 0, 0, time.UTC)
+	store.Append(Point{
+		UnitID: 1, EventTime: base, ReceiveTime: base.Add(30 * time.Second),
+		SpeedKmh: 99,
+	})
+	if _, ok := store.StateAsOf(1, base.Add(10*time.Second)); ok {
+		t.Error("точка, пришедшая после границы, попала в срез")
+	}
+	if _, ok := store.StateAsOf(1, base.Add(time.Minute)); !ok {
+		t.Error("точка не попала в срез, хотя пришла вовремя")
+	}
+}
+
+// Машина, включившаяся посреди ячейки, не имеет состояния на момент начала
+// этой ячейки. Это должно быть «нет данных», а не состояние из будущего:
+// до первого кадра лучше, чем кадр с подменённым T.
+func TestStateAsOfHasNothingBeforeFirstPoint(t *testing.T) {
+	store := New()
+	base := time.Date(2026, 1, 6, 8, 0, 0, 0, time.UTC)
+	store.Append(Point{
+		UnitID: 1, EventTime: base.Add(2 * time.Minute), ReceiveTime: base.Add(2 * time.Minute),
+	})
+	if _, ok := store.StateAsOf(1, base); ok {
+		t.Error("состояние нашлось до первой точки")
+	}
+	if _, ok := store.StateAsOf(9, base); ok {
+		t.Error("состояние нашлось у неизвестной машины")
+	}
+}
+
+// При одинаковом времени события побеждает более поздний пакет: сортировка
+// устойчивая, и порядок прихода сохраняется.
+func TestStateAsOfPrefersLatestOnEqualEventTime(t *testing.T) {
+	store := New()
+	base := time.Date(2026, 1, 6, 8, 0, 0, 0, time.UTC)
+	store.Append(Point{UnitID: 1, EventTime: base, ReceiveTime: base, SpeedKmh: 10})
+	store.Append(Point{
+		UnitID: 1, EventTime: base, ReceiveTime: base.Add(time.Second), SpeedKmh: 20,
+	})
+	state, ok := store.StateAsOf(1, base.Add(time.Minute))
+	if !ok {
+		t.Fatal("состояние не найдено")
+	}
+	if got := state.Point.SpeedKmh; got != 20 {
+		t.Errorf("скорость %g, ожидалось 20", got)
+	}
+}
+
+// Пакет с меткой события из будущего, пришедший вовремя, в состояние на
+// момент T не попадает. Это перекос часов устройства, а не редкий крайний
+// случай: такие пакеты приходят от каждого второго терминала, и если такой
+// пакет станет состоянием, кадр получит скорость и координаты из будущего.
+func TestStateAsOfSkipsFutureEventTime(t *testing.T) {
+	at := time.Date(2026, 1, 6, 8, 5, 0, 0, time.UTC)
+	s := New()
+	s.Append(Point{
+		UnitID: 1, EventTime: at.Add(-2 * time.Minute), ReceiveTime: at.Add(-2 * time.Minute),
+		Longitude: 37.6, Latitude: 55.8, SpeedKmh: 12, LocationValid: true,
+	})
+	// Событие на две минуты позже T, но пакет принят до T.
+	s.Append(Point{
+		UnitID: 1, EventTime: at.Add(2 * time.Minute), ReceiveTime: at.Add(-time.Minute),
+		Longitude: 37.9, Latitude: 55.8, SpeedKmh: 90, LocationValid: true,
+	})
+
+	state, ok := s.StateAsOf(1, at)
+	if !ok {
+		t.Fatal("состояние на момент T не найдено")
+	}
+	if state.Point.SpeedKmh != 12 {
+		t.Errorf("скорость состояния %g, ожидалось 12: взят пакет с меткой из будущего",
+			state.Point.SpeedKmh)
+	}
+	if got := state.PointsInWindow; got != 1 {
+		t.Errorf("точек в окне %d, ожидалась 1", got)
+	}
+}
