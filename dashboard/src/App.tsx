@@ -50,6 +50,7 @@ export default function App() {
   // позже (воркер maplibre, стиль), и тогда без границы ошибок React
   // размонтирует весь дашборд. Здесь падение карты не стоит панелей.
   const [mapFailed, setMapFailed] = useState(false)
+  const [mapFailMsg, setMapFailMsg] = useState<string | null>(null)
   const canvasFallback = !webgl || mapFailed
 
   useEffect(() => {
@@ -160,12 +161,15 @@ export default function App() {
       <main>
         <div className="map-col">
           {!webgl && <div className="warnbar">GPU/WebGL недоступен — включён canvas-фолбэк (требование офлайн-демо).</div>}
-          {webgl && mapFailed && <div className="warnbar">MapLibre не инициализировался (см. консоль) — включён canvas-фолбэк: карта в сетке координат, панели живут.</div>}
+          {webgl && mapFailed && <div className="warnbar">{mapFailMsg ?? 'MapLibre не инициализировался (см. консоль)'} — включён canvas-фолбэк: карта в сетке координат, панели живут.</div>}
           {canvasFallback
             ? <CanvasMap store={store} routes={routes} selected={selected} onSelect={setPicked} />
             : (
               <MapBoundary onFailure={() => setMapFailed(true)}>
-                <MapView store={store} routes={routes} selected={selected} onSelect={setPicked} />
+                <MapView
+                  store={store} routes={routes} selected={selected} onSelect={setPicked}
+                  onEngineFail={(msg) => { setMapFailMsg(msg); setMapFailed(true) }}
+                />
               </MapBoundary>
             )}
           <div className="legend">

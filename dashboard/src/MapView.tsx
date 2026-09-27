@@ -1,12 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 // первым импортом — модуль с URL воркера: без него карта не поднимется ни в
 // dev, ни в собранном dist (см. ./maplibregl.ts)
 import './maplibregl'
-import { AttributionControl, Map, NavigationControl } from 'maplibre-gl'
+import { AttributionControl, Map, Marker, NavigationControl } from 'maplibre-gl'
 import type { GeoJSONSource, ExpressionSpecification, StyleSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
-import YMapView from './YMapView'
-import { loadYmaps, ymapsApiKey, type YMaps3 } from './ymaps'
 import type { Store } from './store'
 import type { RouteFC, RouteGeom, Bounds } from './geo'
 import { routesBounds, routeGeometries, mergeBounds, pointsBounds, graticuleFC, niceStep } from './geo'
@@ -22,6 +20,8 @@ function vehiclesFC(vehicles: Iterable<VehicleState>, clock: number, selected: n
         tr_id: v.tr_id,
         risk: vehicleRisk(v, clock),
         selected: v.tr_id === selected ? 1 : 0,
+        speed: v.speed,
+        heading: v.heading,
       },
       geometry: { type: 'Point' as const, coordinates: [v.lon, v.lat] },
     })),
@@ -53,59 +53,21 @@ const OFFLINE_STYLE: StyleSpecification = {
 // телеметрии камера показывает город, а не «нулевой остров» у экватора.
 const MOSCOW_CENTER: [number, number] = [37.6173, 55.7558]
 
-// Настоящая подложка по умолчанию: растровые тайлы CARTO dark — совпадают с
-// тёмной темой дашборда, данные © OpenStreetMap. Свой style.json (со своими
-// тайлами и подписями) по-прежнему приоритетнее: VITE_MAP_STYLE ниже.
-const CARTO_TILES = ['a', 'b', 'c', 'd'].map(
-  (s) => `https://${s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png`,
-)
-
-function moscowBasemap(): StyleSpecification {
-  return {
-    version: 8,
-    sources: {
-      'ndtp-basemap': {
-        type: 'raster',
-        tiles: CARTO_TILES,
-        tileSize: 256,
-        maxzoom: 20,
-        attribution: '© OpenStreetMap contributors © CARTO',
-      },
-    },
-    layers: [
-      // фон под тайлами: где тайл ещё не доехал — цвет дашборда, а не белый
-      { id: 'bg', type: 'background', paint: { 'background-color': '#101418' } },
-      { id: 'ndtp-basemap-tiles', type: 'raster', source: 'ndtp-basemap' },
-    ],
-  }
-}
-
-// Проба «есть ли сеть вообще» — один тайл над Москвой (z=11): недоступен —
-// остаёмся на офлайн-стиле с сеткой координат.
-const MOSCOW_TILE_PROBE = 'https://a.basemaps.cartocdn.com/dark_all/11/1238/640.png'
-
 /**
- * VITE_MAP_STYLE — необязательная настоящая подложка: style.json с тайлами и
- * подписями. Пусто, недоступно или не отдаёт 200 — остаёмся на офлайн-стиле,
- * чтобы демо не падало в пустоту вместе с сетью. Проба одним запросом до
- * подстановки стиля: у maplibre нет асинхронного фолбэка, а setStyle на
- * несуществующий URL оставляет карту навсегда пустой.
+ * Единственная внешняя подложка, которую дашборд знает: свой style.json через
+ * VITE_MAP_STYLE. Пусто (по умолчанию), недоступно или не отдаёт 200 —
+ * остаёмся на офлайн-фоне: тёмный background + сетка координат
+ * (docs/architecture.md §6: демо работает без сети и без сторонних тайловых
+ * сервисов). Проба одним запросом до подстановки стиля: у maplibre нет
+ * асинхронного фолбэка, а setStyle на несуществующий URL оставляет карту
+ * навсегда пустой.
  */
-async function probeOnlineStyle(): Promise<string | StyleSpecification | null> {
+async function probeOnlineStyle(): Promise<string | null> {
   const url = import.meta.env.VITE_MAP_STYLE
-  if (url) {
-    try {
-      const res = await fetch(url)
-      return res.ok ? url : null
-    } catch {
-      return null
-    }
-  }
-  // Явного стиля нет — проба одного тайла решает «есть ли сеть вообще»:
-  // недоступен — остаёмся на офлайн-сетке (docs/architecture.md §6).
+  if (!url) return null
   try {
-    const res = await fetch(MOSCOW_TILE_PROBE)
-    return res.ok ? moscowBasemap() : null
+    const res = await fetch(url)
+    return res.ok ? url : null
   } catch {
     return null
   }
@@ -124,14 +86,24 @@ interface Props {
   routes: RouteFC | null
   selected: number | null
   onSelect: (trId: number | null) => void
+  /**
+   * Движок карты жив, но бесполезен: стиль так и не загрузился (заблокирован
+   * Web Worker maplibre — типично для жёсткой CSP или урезанных браузеров).
+   * Без этого сигнала дашборд стоит с чёрным холстом: ни маршрутной сети, ни
+   * машин — MapBoundary ловит только исключения, а зависший воркер не бросает
+   * ничего. App переключается на CanvasMap.
+   */
+  onEngineFail?: (reason: string) => void
 }
 
-function MapLibreView({ store, routes, selected, onSelect }: Props) {
+export default function MapView({ store, routes, selected, onSelect, onEngineFail }: Props) {
   const holder = useRef<HTMLDivElement | null>(null)
   const selectedRef = useRef<number | null>(selected)
   const onSelectRef = useRef(onSelect)
+  const onEngineFailRef = useRef(onEngineFail)
   useEffect(() => { selectedRef.current = selected }, [selected])
   useEffect(() => { onSelectRef.current = onSelect }, [onSelect])
+  useEffect(() => { onEngineFailRef.current = onEngineFail }, [onEngineFail])
 
   useEffect(() => {
     if (!holder.current) return
@@ -149,6 +121,19 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
 
     let geoms: RouteGeom[] = []
     let disposed = false
+
+    // Watchdog движка: maplibre разбирает стиль в Web Worker. Если воркер
+    // заблокирован (жёсткая CSP, урезанный браузер), стиль не приходит НИКОГДА
+    // — без исключения и без события error: висит чёрный холст без маршрутной
+    // сети и машин. Через 6 с считаем движок мёртвым и отдаём карту
+    // canvas-фолбэку, который рисует то же самое без воркеров и без GPU.
+    let styleOk = false
+    map.on('load', () => { styleOk = true })
+    const watchdog = window.setTimeout(() => {
+      if (!disposed && !styleOk && !map.isStyleLoaded()) {
+        onEngineFailRef.current?.('MapLibre: стиль карты не загрузился (воркер карты не отвечает)')
+      }
+    }, 6000)
     // Настоящая подложка (город, улицы, подписи) активна — сетка координат
     // тогда лишняя: она была офлайн-заменителем карты, а не декорацией поверх.
     let baseOnline = false
@@ -172,17 +157,32 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
 
     // Сетка координат пересчитывается под текущий кадр: при зуме оператора
     // шаг меняется, иначе либо лишние линии, либо пустота.
+    // Два момента, из-за которых сетка раньше «пропадала при перемещении»:
+    // 1) генерировать нужно не впритык по viewport, а с запасом ~1.5× по
+    //    обеим осям: при drag мы выезжаем за старый прямоугольник раньше,
+    //    чем приходит moveend, и за краем линий уже нет;
+    // 2) обновляться надо на 'move' (во время жеста), а не только на
+    //    'moveend' — иначе середина перетаскивания всегда показывает пустоту.
+    // Обновление дешёвое: 10–30 коротких линий на кадр, коалесится maplibre.
     const updateGrid = () => {
       const src = map.getSource('ndtp-grid') as GeoJSONSource | undefined
       if (!src) return
       const b = map.getBounds()
       if (!b) return
-      const box: Bounds = [[b.getWest(), b.getSouth()], [b.getEast(), b.getNorth()]]
-      const midLat = (box[0][1] + box[1][1]) / 2
+      const [[west, south], [east, north]] = [
+        [b.getWest(), b.getSouth()], [b.getEast(), b.getNorth()],
+      ] as Bounds
+      const midLat = (south + north) / 2
+      // шаг считаем по видимому экрану (не по раздутому прямоугольнику),
+      // иначе сетка на pad'е стала бы вдвое реже; раздутым box'ом только
+      // покрываем область генерации
       const span = Math.max(
-        box[1][0] - box[0][0],
-        (box[1][1] - box[0][1]) * Math.cos((midLat * Math.PI) / 180),
+        east - west,
+        (north - south) * Math.cos((midLat * Math.PI) / 180),
       )
+      const padX = (east - west) * 0.6
+      const padY = (north - south) * 0.6
+      const box: Bounds = [[west - padX, south - padY], [east + padX, north + padY]]
       src.setData(graticuleFC(box, niceStep(span)) as never)
     }
 
@@ -253,7 +253,10 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
     // style.load, а не только load: подстановка внешней подложки перезагружает
     // стиль и сносит наши слои — install() их возвращает.
     map.on('style.load', install)
-    map.on('moveend', updateGrid)
+    // 'move', а не 'moveend': сетка догоняет камеру во время жеста, а не
+    // после — иначе всё время перетаскивания за старым прямоугольником
+    // линии уже не рисуются (см. комментарий в updateGrid)
+    map.on('move', updateGrid)
 
     map.on('click', 'ndtp-vehicles-dot', (e) => {
       const f = e.features?.[0]
@@ -269,6 +272,41 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
       map.getCanvas().style.cursor = ''
     })
 
+    // Текущее положение ТС поверх маршрутной сети: стрелка направления
+    // движения + бирка «№ · скорость». DOM-маркеры, а не symbol-слой: для
+    // текста в слоях maplibre нужен сетевой glyphs-сервер, а демо обязано
+    // работают офлайн. pointer-events: none в CSS — клик и hover остаются на
+    // circle-слое точек под маркером (он же рисует риск-цвет и кольцо
+    // выделения). Map тут занят классом maplibre — глобальный берём явно.
+    const heads = new globalThis.Map<number, { m: Marker; dir: HTMLDivElement; tag: HTMLSpanElement }>()
+    const drawHeads = (vehicles: Iterable<VehicleState>) => {
+      const seen = new globalThis.Set<number>()
+      for (const v of vehicles) {
+        seen.add(v.tr_id)
+        let rec = heads.get(v.tr_id)
+        if (!rec) {
+          const el = document.createElement('div')
+          el.className = 'veh-head'
+          const dir = document.createElement('div')
+          dir.className = 'veh-dir'
+          const tag = document.createElement('span')
+          tag.className = 'veh-tag'
+          el.append(dir, tag)
+          const m = new Marker({ element: el, anchor: 'center' }).addTo(map)
+          rec = { m, dir, tag }
+          heads.set(v.tr_id, rec)
+        }
+        rec.m.setLngLat([v.lon, v.lat])
+        rec.dir.style.transform = `rotate(${Number.isFinite(v.heading) ? v.heading : 0}deg)`
+        rec.dir.style.borderBottomColor = RISK_COLORS[vehicleRisk(v, store.clock)]
+        rec.tag.textContent = `ТС ${v.tr_id} · ${Math.round(v.speed)} км/ч`
+        rec.tag.classList.toggle('sel', v.tr_id === selectedRef.current)
+      }
+      for (const [id, rec] of heads) {
+        if (!seen.has(id)) { heads.delete(id); rec.m.remove() }
+      }
+    }
+
     let raf = 0
     const redraw = () => {
       if (raf) return
@@ -280,6 +318,9 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
         segs?.setData(riskSegmentsFC(geoms, store.vehicles.values(), store.clock) as never)
         const traveled = map.getSource('ndtp-traveled') as GeoJSONSource | undefined
         traveled?.setData(traveledRoutesFC(geoms, store.vehicles.values(), store.clock) as never)
+        // маркеры живут в DOM и не зависят от стиля — обновляем всегда:
+        // так стрелки и бирки видны даже пока внешняя подложка догружается
+        drawHeads(store.vehicles.values())
         fitOnce() // позиция могла приехать позже, чем стиль прогрузился
       })
     }
@@ -293,14 +334,17 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
       // обязан увидеть онлайн-подложку и не рисовать сетку
       baseOnline = true
       map.setStyle(style)
-      // атрибуция нужна только настоящей подложке (требование OSM/CARTO);
-      // на офлайн-сетке показывать нечего
+      // атрибуция нужна только внешней подложке (требование её тайлового
+      // сервиса); на офлайн-сетке показывать нечего
       map.addControl(new AttributionControl({ compact: true }), 'bottom-right')
     })
 
     return () => {
       disposed = true
+      window.clearTimeout(watchdog)
       if (raf) cancelAnimationFrame(raf)
+      for (const [, rec] of heads) rec.m.remove()
+      heads.clear()
       if (redrawRef.current === redraw) redrawRef.current = () => {}
       unsub()
       if (import.meta.env.DEV && (window as unknown as { __ndtpMap?: Map }).__ndtpMap === map) {
@@ -315,34 +359,4 @@ function MapLibreView({ store, routes, selected, onSelect }: Props) {
   useEffect(() => { redrawRef.current() }, [selected])
 
   return <div ref={holder} className="map-holder" />
-}
-
-/**
- * Точка входа карты: при валидном VITE_YANDEX_MAPS_API_KEY — Яндекс JS API
- * (тёмная схема с кастомизацией, §docs customization), иначе — офлайн-движок
- * MapLibre. Загрузка Яндекса асинхронная: битый ключ, отсутствие сети или
- * неподтверждённый реферер не роняют дашборд — тихо откатываемся на MapLibre
- * (одно warning в консоль) и живём с подложкой/сеткой как раньше.
- */
-export default function MapView(props: Props) {
-  const [engine, setEngine] = useState<'pending' | 'yandex' | 'libre'>(
-    () => (ymapsApiKey() ? 'pending' : 'libre'),
-  )
-  const [api, setApi] = useState<YMaps3 | null>(null)
-  useEffect(() => {
-    if (engine !== 'pending') return
-    let alive = true
-    loadYmaps().then(
-      (a) => { if (alive) { setApi(a); setEngine('yandex') } },
-      (err: Error) => {
-        if (!alive) return
-        console.warn(`[ndtp] ${err.message}; карта на офлайн-движке MapLibre`)
-        setEngine('libre')
-      },
-    )
-    return () => { alive = false }
-  }, [engine])
-  if (engine === 'yandex' && api) return <YMapView api={api} {...props} />
-  if (engine === 'pending') return <div className="map-holder" />
-  return <MapLibreView {...props} />
 }

@@ -24,6 +24,29 @@ main { display: flex; flex: 1; min-height: 0; }
   position: absolute; left: 10px; bottom: 10px; font-size: 11px;
   background: #1d242c; color: #8b98a5; padding: 2px 8px; border-radius: 4px;
 }
+
+/* Маркер текущего положения ТС (DOM-оверлей в MapLibre поверх circle-слоя).
+   Контейнер нулевого размера стоит в точке машины, дети позиционируются
+   отрицательными offset'ами — так центр стрелки/точки совпадает с координатой.
+   pointer-events: none на контейнере: клик и hover остаются на
+   circle-слое точек под маркером. */
+.veh-head { position: relative; width: 0; height: 0; pointer-events: none; z-index: 1; }
+.veh-dot {
+  position: absolute; left: -7px; top: -7px; width: 14px; height: 14px;
+  border-radius: 50%; border: 2px solid #0b0e11; cursor: pointer; pointer-events: auto;
+}
+.veh-dir {
+  position: absolute; left: -5px; top: -20px; width: 0; height: 0;
+  border-left: 5px solid transparent; border-right: 5px solid transparent;
+  border-bottom: 8px solid #2ecc71; transform-origin: 5px 20px;
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.7));
+}
+.veh-tag {
+  position: absolute; left: 11px; top: -8px; font-size: 10px; line-height: 1.5;
+  padding: 0 5px; border-radius: 3px; white-space: nowrap;
+  background: rgba(11, 14, 17, 0.82); color: #cfd8e3;
+}
+.veh-tag.sel { outline: 1px solid #fff; color: #fff; }
 .legend {
   display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
   padding: 5px 12px; font-size: 12px; color: #8b98a5;

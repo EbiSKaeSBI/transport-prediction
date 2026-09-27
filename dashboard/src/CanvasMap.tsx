@@ -111,8 +111,19 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
           ctx.strokeStyle = '#fff'; ctx.lineWidth = 2
           ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.stroke()
         }
+        // стрелка направления и бирка — та же семантика, что в MapLibre-версии
+        // (heading 0 = север, поворот по часовой; canvas y-ось вниз — совпадает)
+        ctx.save()
+        ctx.translate(x, y)
+        ctx.rotate(((Number.isFinite(v.heading) ? v.heading : 0) * Math.PI) / 180)
+        ctx.fillStyle = RISK_COLORS[risk]
+        ctx.beginPath(); ctx.moveTo(0, -13); ctx.lineTo(4.5, -5); ctx.lineTo(-4.5, -5); ctx.closePath(); ctx.fill()
+        ctx.restore()
         ctx.fillStyle = RISK_COLORS[risk]
         ctx.beginPath(); ctx.arc(x, y, 4.5, 0, Math.PI * 2); ctx.fill()
+        ctx.fillStyle = '#cfd8e3'
+        ctx.font = '10px ui-monospace, monospace'
+        ctx.fillText(`ТС ${v.tr_id} · ${Math.round(v.speed)} км/ч`, x + 9, y - 4)
       }
     }
 
