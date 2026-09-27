@@ -178,15 +178,15 @@ type vehicleView struct {
 
 // predictionView — прогноз в ответе API.
 type predictionView struct {
-	SampleID      string  `json:"sample_id"`
-	TargetStopID  int64   `json:"target_stop_id"`
-	HorizonS      float64 `json:"horizon_s"`
+	SampleID     string  `json:"sample_id"`
+	TargetStopID int64   `json:"target_stop_id"`
+	HorizonS     float64 `json:"horizon_s"`
 	// CurDevS — измеренное отклонение «сейчас». null, если кадр не дал
 	// фактов прошлых остановок: отсутствие замера и нулевое отклонение —
 	// разные вещи, и панель обязана их различать.
-	CurDevS       *float64        `json:"cur_dev_s"`
-	DeltaS        float64         `json:"delta_s"`
-	PredictedDevS float64         `json:"predicted_dev_s"`
+	CurDevS       *float64 `json:"cur_dev_s"`
+	DeltaS        float64  `json:"delta_s"`
+	PredictedDevS float64  `json:"predicted_dev_s"`
 	// PLate — указатель не из любви к указателям: у прогноза может не быть
 	// вероятности (baseline, модель без P(late)-головы), и тогда на проводе
 	// должно быть null, а не 0. Ключ остаётся обязательным — меняется значение,

@@ -104,4 +104,4 @@ func (r *orderRecorder) OnHandshake(uint32, ndtp.ConnRequest) {}
 func (r *orderRecorder) OnRealtime(uint32, ndtp.Frame, []ndtp.Cell) {
 }
 func (r *orderRecorder) OnMalformed(uint32, ndtp.Frame, error) {}
-func (r *orderRecorder) OnDisconnect(uint32)                        { r.mark() }
+func (r *orderRecorder) OnDisconnect(uint32)                   { r.mark() }
