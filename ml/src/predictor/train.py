@@ -6,7 +6,7 @@
 (:class:`sklearn.model_selection.GroupKFold` по ``tr_id`` — в test-holdout для
 ранней остановки не заглядываем вообще).
 
-Режим v3 (:option:`--target delta`): таргет ``delay_delta_s = target_delay_s −
+Режим v3 (``--target delta``): таргет ``delay_delta_s = target_delay_s −
 cur_dev_s``, а итоговое предсказание на holdout собирается как
 ``cur_dev_s + delta_pred`` и скорится в абсолютных секундах — ключевой приём
 §5.1 (дельта предсказывать много легче, чем абсолют). Режим пишется в метрики

@@ -142,7 +142,7 @@ func New(cfg Config) (*Pipeline, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if cfg.Schedule == nil || cfg.Binding == nil {
+	if cfg.Holder == nil && (cfg.Schedule == nil || cfg.Binding == nil) {
 		logger.Warn("конвейер без расписания: телеметрия принимается, прогноз не строится",
 			"schedule", cfg.Schedule == nil, "binding", cfg.Binding == nil)
 	}

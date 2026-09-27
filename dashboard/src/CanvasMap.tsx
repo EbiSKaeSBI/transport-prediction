@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { Store } from './store'
 import type { RouteFC } from './geo'
-import { routeColor, routeGeometries, routesBounds, mergeBounds, pointsBounds, graticuleFC, niceStep } from './geo'
+import { routeColor, routeGeometries, routesBounds, mergeBounds, pointsBounds, graticuleFC, niceStep, snapVehicle } from './geo'
 import { RISK_COLORS, vehicleRisk, riskSegmentsFC } from './risk'
 
 interface Props {
@@ -44,6 +44,10 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
     }
     resize()
     window.addEventListener('resize', resize)
+
+    // Геометрии планов для прижимания ТС: только отрисовка, store остаётся
+    // с сырой телеметрией (см. geo.snapVehicle).
+    const geoms = routeGeometries(routes)
 
     // Рамка — по плану и по позициям ТС одновременно, один раз. План без машин
     // не берём: демо-фид кладёт телеметрию в 8 км от плана, и рамка только по
@@ -95,7 +99,7 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
       }
       // участки маршрутов с риском ТС — тот же riskSegmentsFC, что в MapView:
       // фолбэк не должен врать иначе, чем основная карта
-      for (const seg of riskSegmentsFC(routeGeometries(routes), store.vehicles.values(), store.clock).features) {
+      for (const seg of riskSegmentsFC(geoms, store.vehicles.values(), store.clock).features) {
         const [a, b] = seg.geometry.coordinates
         const [x1, y1] = project(a[0], a[1])
         const [x2, y2] = project(b[0], b[1])
@@ -105,7 +109,8 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
         ctx.globalAlpha = 1
       }
       for (const v of store.vehicles.values()) {
-        const [x, y] = project(v.lon, v.lat)
+        const pos = snapVehicle(v, geoms)
+        const [x, y] = project(pos.lon, pos.lat)
         const risk = vehicleRisk(v, store.clock)
         if (selectedRef.current === v.tr_id) {
           ctx.strokeStyle = '#fff'; ctx.lineWidth = 2
@@ -121,7 +126,8 @@ export default function CanvasMap({ store, routes, selected, onSelect }: Props) 
       const px = e.clientX - r.left, py = e.clientY - r.top
       let best: number | null = null, bestD = 14
       for (const v of store.vehicles.values()) {
-        const [x, y] = project(v.lon, v.lat)
+        const pos = snapVehicle(v, geoms)
+        const [x, y] = project(pos.lon, pos.lat)
         const d = Math.hypot(x - px, y - py)
         if (d < bestD) { bestD = d; best = v.tr_id }
       }

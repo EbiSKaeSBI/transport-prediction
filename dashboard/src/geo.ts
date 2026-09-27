@@ -10,9 +10,14 @@ export interface RouteFC {
   }[]
 }
 
+// Палитра только из светлых тонов: линии рисуются поверх тёмного офлайн-фона
+// (#101418) с line-opacity 0.8, и тёмные цвета (#000075, #800000 из старого
+// набора) на нём исчезают — маршрут остаётся пунктиром точек останов, а
+// прижатая к линии машина выглядит «сошедшей с путей».
 const ROUTE_PALETTE = [
   '#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4', '#46f0f0',
-  '#f032e6', '#bcf60c', '#fabebe', '#008080', '#e6beff', '#800000', '#000075',
+  '#f032e6', '#bcf60c', '#fabebe', '#00ced1', '#e6beff', '#ff6f61',
+  '#7b68ee',
 ]
 
 export function routeColor(route: string): string {
@@ -42,6 +47,29 @@ export interface PlanStop {
 }
 
 /**
+ * PLAN_WINDOW_PAST_S / PLAN_WINDOW_FUTURE_S — отображаемое окно плана:
+ * −20 мин назад (окно фактических наблюдений генератора плана) и +15 мин
+ * вперёд (горизонт прогноза по ТЗ). live-план синтезируется из записи, и
+ * всё, что дальше головы записи, — экстраполяция по касательной: она
+ * перерисовывается на каждом replan и каждый раз иначе. Резать её глазам —
+ * не прятать ошибку, а показывать маршрутом только то, что ещё можно
+ * назвать маршрутом: проеханный след и горизонт предсказания.
+ */
+export const PLAN_WINDOW_PAST_S = 20 * 60
+export const PLAN_WINDOW_FUTURE_S = 15 * 60
+
+/** Остановки плана, чьё время в окне [now−PAST, now+FUTURE]. Окно полупустое — оставляет как есть. */
+export function trimPlanWindow(stops: PlanStop[], nowMs = Date.now()): PlanStop[] {
+  const from = nowMs / 1000 - PLAN_WINDOW_PAST_S
+  const to = nowMs / 1000 + PLAN_WINDOW_FUTURE_S
+  const inw = stops.filter(s => {
+    const t = Date.parse(s.time_begin) / 1000
+    return Number.isFinite(t) && t >= from && t <= to
+  })
+  return inw.length >= 2 ? inw : stops
+}
+
+/**
  * routesFromPlan — live-карта: список остановок каждого TRID от gateway
  * превращается в тот же RouteFC, что replay строит из routes.geojson
  * (polyline на машину + точки остановок). Панели о источнике не знают.
@@ -54,11 +82,14 @@ export function routesFromPlan(lists: PlanStop[][]): RouteFC {
     const first = stops[0]
     if (!first) continue
     const route = String(first.tr_id)
-    features.push({
-      type: 'Feature',
-      properties: { kind: 'route', tr_id: first.tr_id, route, stops: stops.length },
-      geometry: { type: 'LineString', coordinates: stops.map(s => [s.lon, s.lat]) },
-    })
+    // Линия имеет смысл от двух точек; одна остановка — только точка.
+    if (stops.length >= 2) {
+      features.push({
+        type: 'Feature',
+        properties: { kind: 'route', tr_id: first.tr_id, route, stops: stops.length },
+        geometry: { type: 'LineString', coordinates: stops.map(s => [s.lon, s.lat]) },
+      })
+    }
     for (const s of stops) {
       // action_id — он же target_stop_id в прогнозе: панель инцидентов
       // ищет имя остановки по этому ключу, как и в replay по stop_id
@@ -202,4 +233,59 @@ export function nearestSegment(
     if (d < best.dist_m) best = { idx: i, dist_m: d }
   }
   return best
+}
+
+/**
+ * SNAP_MAX_DEVIATION_M — предел прижимания точки к маршруту. Зеркалит
+ * mapmatch.DefaultSearchRadiusM (backend/internal/mapmatch/mapmatch.go):
+ * дальше 400 м начинается осмысленное «вне маршрута» (депо, другой участок —
+ * 12 % точек validate лежат за ним), и на карте это надо видеть, а не прятать
+ * за проекцией. Расхождение порога с бэкендом означало бы, что дашборд
+ * прижимает к плану то, что признаки честно помечают как off-route.
+ */
+export const SNAP_MAX_DEVIATION_M = 400
+
+export interface SnapResult {
+  lon: number
+  lat: number
+  /** true — точка прижата к полилинии; false — лежала за порогом или полилинии нет. */
+  snapped: boolean
+}
+
+/**
+ * Дисплейная позиция машины: сырые координаты прижаты к ближайшему звену
+ * полилинии её собственного маршрута (tr_id), если расстояние не больше
+ * порога. Прижимание — только отрисовка: store и API сохраняют телеметрию
+ * как есть. Без него GPS-шум (медиана 8–32 м от хорды остановок, см. док
+ * пакета mapmatch) рисует зигзаг рядом с планом, и зрителю это читается как
+ * «транспорт сошёл с маршрута» — ровно то впечатление, которое демо не
+ * должно производить.
+ */
+export function snapVehicle(
+  v: { tr_id: number; lon: number; lat: number },
+  geoms: RouteGeom[],
+  maxDevM = SNAP_MAX_DEVIATION_M,
+): SnapResult {
+  if (!Number.isFinite(v.lon) || !Number.isFinite(v.lat)) {
+    return { lon: v.lon, lat: v.lat, snapped: false }
+  }
+  let best: { d: number; lon: number; lat: number } | null = null
+  for (const g of geoms) {
+    if (g.tr_id !== v.tr_id || g.coords.length < 2) continue
+    const cos = Math.cos((v.lat * Math.PI) / 180)
+    const px = v.lon * M_PER_DEG * cos
+    const py = v.lat * M_PER_DEG
+    for (let i = 0; i + 1 < g.coords.length; i++) {
+      const ax = g.coords[i][0] * M_PER_DEG * cos, ay = g.coords[i][1] * M_PER_DEG
+      const bx = g.coords[i + 1][0] * M_PER_DEG * cos, by = g.coords[i + 1][1] * M_PER_DEG
+      const dx = bx - ax, dy = by - ay
+      const l2 = dx * dx + dy * dy
+      const t = l2 > 0 ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l2)) : 0
+      const qx = ax + t * dx, qy = ay + t * dy
+      const d = Math.hypot(qx - px, qy - py)
+      if (!best || d < best.d) best = { d, lon: qx / (M_PER_DEG * cos), lat: qy / M_PER_DEG }
+    }
+  }
+  if (!best || best.d > maxDevM) return { lon: v.lon, lat: v.lat, snapped: false }
+  return { lon: best.lon, lat: best.lat, snapped: true }
 }

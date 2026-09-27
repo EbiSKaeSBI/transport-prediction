@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# Эмулятор NDTP в пейне Zellij: поднимает JAR, заливает конфиг юнитов
-# (ids из train/traffic.csv) и показывает живой лог.
+# Эмулятор NDTP в пейне Zellij. В реальном контуре он по умолчанию НЕ
+# нужен: машины гонит dataset_feed из train/traffic.csv. Эмулятор — источник
+# случайных кривых (docs/Emulator-and-Telematic-Packets-Specification.md,
+# «План стареет: эмулятор едет быстрее плана»), полезен для стресс-проверок:
+# переподключения, off-route поведения, загрузки statestore.
+# Включается: EMULATOR=1 make dev (или make emu-up + make emu-config).
 set -u
 cd "$(dirname "$0")/.."
+if [ "${EMULATOR:-0}" != "1" ]; then
+    echo "Эмулятор выключен: живой поток играет реальный датасет (dataset_feed)."
+    echo "Нужен эмулятор — EMULATOR=1 make dev (или make emu-up + make emu-config)."
+    exec bash -l
+fi
 if ! python3 scripts/emu_native.py serve; then
     echo
     echo "Эмулятор не поднят: поместите ndtp-telemetry-emulator.tar в корень"

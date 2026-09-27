@@ -5,7 +5,7 @@ import type { DataSource } from './source'
 import MapView from './MapView'
 import MapBoundary from './MapBoundary'
 import type { PlanStop, RouteFC } from './geo'
-import { paintRoutes, routesFromPlan } from './geo'
+import { paintRoutes, routesFromPlan, trimPlanWindow } from './geo'
 import CanvasMap from './CanvasMap'
 import {
   Clock,
@@ -65,27 +65,38 @@ export default function App() {
     }
     if (live) {
       // Live: маршруты — план-график самого gateway (GET /api/v1/routes +
-      // /routes/{tr}/stops). Geojson-файла здесь нет и не будет: источник
-      // истины — тот же schedule, по которому считаются прогнозы.
+      // /routes/{tr}/stops), прореженный окном −20/+15 мин (geo.trimPlanWindow).
+      // Geojson-файла здесь нет и не будет: источник истины — тот же
+      // schedule, по которому считаются прогнозы. Цикл replan перезаписывает
+      // plan.csv, поэтому план перезагружается раз в минуту — карта живая,
+      // но tangent-хвосты за головой записи на ней не мелькают.
       const base = apiBase()
-      fetch(`${base}/api/v1/routes`)
-        .then(async r => {
+      let loadedOnce = false
+      const load = async () => {
+        try {
+          const r = await fetch(`${base}/api/v1/routes`)
           if (!r.ok) throw new Error(`HTTP ${r.status}`)
           const data = await r.json() as { routes?: { tr_id: number }[] }
           const lists = await Promise.all((data.routes ?? []).map(rt =>
             fetch(`${base}/api/v1/routes/${rt.tr_id}/stops`)
               .then(s => (s.ok ? s.json() : { stops: [] }))
-              .then(d => (d.stops ?? []) as PlanStop[])))
+              .then(d => trimPlanWindow((d.stops ?? []) as PlanStop[]))))
           if (!mounted) return
           const fc = paintRoutes(routesFromPlan(lists))
           setStopNames(takeNames(fc))
           setRoutes(fc)
-        })
-        .catch(() => {
-          // не fatal: машины видны и без плана (fitBy по траекториям в MapView)
-          if (mounted) setError('План-график с gateway не пришёл — карта без маршрутов (serve без --plan?)')
-        })
-      return () => { mounted = false }
+          loadedOnce = true
+          setError(null)
+        } catch {
+          // не fatal: машины видны и без плана (fitBy по траекториям в MapView).
+          // Ошибка видна только когда плана не было вовсе — мигать ею при
+          // неудачной перезагрузке работающей карты не нужно.
+          if (mounted && !loadedOnce) setError('План-график с gateway не пришёл — карта без маршрутов (serve без --plan?)')
+        }
+      }
+      void load()
+      const iv = window.setInterval(() => void load(), 60_000)
+      return () => { mounted = false; window.clearInterval(iv) }
     }
     fetch('/demo/routes.geojson')
       .then(r => {

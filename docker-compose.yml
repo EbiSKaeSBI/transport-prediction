@@ -1,0 +1,121 @@
+# docker compose up -d --build
+# Три обязательных модуля + опциональный плеер исторического датасета.
+#   dashboard  :8088  — BI-дашборд (nginx: статика + прокси /api /ws на backend)
+#   backend    :8080  — REST/WS/Swagger, :9201 — приём NDTP-телеметрии
+#   ml         :8000  — FastAPI-инференс (внутри сети, снаружи не нужен)
+#   feed (profile "feed") — играет train/ в :9201 с перегенерацией плана
+name: ndtp
+services:
+  # одноразовый: собирает plan.csv/binding.csv из train/ в общий том —
+  # backend требует существующий план (dry-run без файла — только на хосте,
+  # где make dev трогает пустой). После --generate-only контейнер выходит 0.
+  plan-init:
+    image: python:3.12-slim
+    working_dir: /repo
+    volumes:
+      - .:/repo
+      - data:/data
+    command:
+      - python
+      - scripts/dataset_feed.py
+      - --dataset-dir
+      - train
+      - --units
+      - "4"
+      - --generate-only
+      - --plan-out
+      - /data/plan.csv
+      - --binding-out
+      - /data/binding.csv
+  ml:
+    build: ./ml
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+  backend:
+    build: ./backend
+    command:
+      - transportctl
+      - serve
+      - --listen
+      - ":9201"
+      - --http
+      - ":8080"
+      - --plan
+      - /data/plan.csv
+      - --binding
+      - /data/binding.csv
+      - --plan-watch
+      - 1s
+      - --capture-out
+      - /tmp/capture
+      - --ml
+      - http://ml:8000
+      - --tick
+      - 5s
+      - --grid
+      - 5s
+      - --stats
+      - 30s
+    volumes:
+      - data:/data
+    ports:
+      - "8080:8080" # REST + WS + Swagger
+      - "9201:9201" # NDTP-телеметрия (сюда шлёт эмулятор/плеер с хоста)
+    depends_on:
+      ml:
+        condition: service_healthy
+      plan-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "8088:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+  # docker compose --profile feed up -d — полный live-контур «из коробки»:
+  # плеер читает смонтированный train/, пишет план в общий том, backend
+  # подхватывает его по --plan-watch за секунду.
+  feed:
+    image: python:3.12-slim
+    profiles: ["feed"]
+    working_dir: /repo
+    volumes:
+      # весь репозиторий: dataset_feed привязан к корню (шаблон golden-кадров
+      # лежит в backend/internal/ndtp/testdata), план пишется в общий том
+      - .:/repo
+      - data:/data
+    command:
+      - python
+      - scripts/dataset_feed.py
+      - --dataset-dir
+      - train
+      - --units
+      - "4"
+      - --speed
+      - "1"
+      - --host
+      - backend
+      - --port
+      - "9201"
+      - --plan-out
+      - /data/plan.csv
+      - --binding-out
+      - /data/binding.csv
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  data:
