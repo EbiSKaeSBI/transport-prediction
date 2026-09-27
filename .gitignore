@@ -50,7 +50,18 @@ catboost_info/
 # Производные признаки — пересобираются из data/ одной командой
 *.parquet
 ml/data/
-ml/artifacts/
+# ml/artifacts/* игнорируется целиком, кроме четырёх рантайм-артефактов ниже:
+# ml/Dockerfile копирует боевую пару (регрессор + P(late)) и её метрики в
+# образ. Без них свежий клон не собирается: COPY не находит файлов. Их цена
+# воспроизводства — полный ml-пайплайн (replay→datasets→train), поэтому они
+# в репозитории, а промежуточные датасеты — нет. Паттерн `ml/artifacts/`
+# (каталогом) не годился: из исключённого каталога git не вычитывает файлы,
+# и negate-строки ниже не сработали бы.
+ml/artifacts/*
+!ml/artifacts/model_v1online.json
+!ml/artifacts/model_v1online_late.json
+!ml/artifacts/metrics_v1online.json
+!ml/artifacts/metrics_v1online_late.json
 
 # Логи
 *.log

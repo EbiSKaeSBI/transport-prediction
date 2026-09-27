@@ -1,0 +1,88 @@
+{
+  "task": "p_late",
+  "threshold_s": 120.0,
+  "features": [
+    "consecutive_late_stops",
+    "cur_dev_s",
+    "distance_to_target_m",
+    "drift_last3_slope",
+    "dwell_current_s",
+    "dwell_last_s",
+    "headway_s",
+    "horizon_s",
+    "is_terminal_stop",
+    "manual_fill",
+    "plan_travel_s",
+    "route_progress",
+    "slack_s",
+    "speed_current",
+    "speed_seg_avg",
+    "speed_seg_max",
+    "stops_remaining",
+    "target_ambiguous",
+    "trip_index"
+  ],
+  "n_train_rows": 4099,
+  "n_holdout_rows": 326,
+  "positive_rate_train": 0.227860453769212,
+  "positive_rate_holdout": 0.25153374233128833,
+  "auc_holdout": 0.9055377848860455,
+  "accuracy_holdout": 0.8220858895705522,
+  "precision_holdout": 0.7857142857142857,
+  "recall_holdout": 0.4024390243902439,
+  "base_accuracy_holdout": 0.7484662576687117,
+  "calibration_holdout": [
+    {
+      "bin": "[0.0; 0.1)",
+      "n": 134,
+      "rate": 0.029850746268656716
+    },
+    {
+      "bin": "[0.1; 0.2)",
+      "n": 69,
+      "rate": 0.07246376811594203
+    },
+    {
+      "bin": "[0.2; 0.3)",
+      "n": 40,
+      "rate": 0.35
+    },
+    {
+      "bin": "[0.3; 0.4)",
+      "n": 27,
+      "rate": 0.7037037037037037
+    },
+    {
+      "bin": "[0.4; 0.5)",
+      "n": 14,
+      "rate": 0.5
+    },
+    {
+      "bin": "[0.5; 0.6)",
+      "n": 6,
+      "rate": 0.3333333333333333
+    },
+    {
+      "bin": "[0.6; 0.7)",
+      "n": 8,
+      "rate": 0.75
+    },
+    {
+      "bin": "[0.7; 0.8)",
+      "n": 12,
+      "rate": 0.8333333333333334
+    },
+    {
+      "bin": "[0.8; 0.9)",
+      "n": 9,
+      "rate": 0.8888888888888888
+    },
+    {
+      "bin": "[0.9; 1.0)",
+      "n": 7,
+      "rate": 1.0
+    }
+  ],
+  "best_iteration": 338,
+  "train_seconds": 0.53
+}
