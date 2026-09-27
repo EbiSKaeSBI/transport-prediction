@@ -124,7 +124,7 @@ class ModelState:
     target_mode: str
     version: str
     metrics: dict | None
-    trained_at: str  # mtime артефакта (в metrics-json даты обучения нет)
+    trained_at: str  # из metrics-json (фолбэк — mtime артефакта)
     loaded_at: str
     late_model: Any = None           # CatBoostClassifier | None
     late_version: str | None = None
@@ -179,7 +179,10 @@ def load_state(model_path: str | Path,
         target_mode=target_mode_for(metrics),
         version=model_path.stem.removeprefix('model_'),
         metrics=metrics,
-        trained_at=_iso(model_path.stat().st_mtime),
+        # trained_at — из метрик (пишет predictor.train): mtime артефакта
+        # врёт на свежем клоне, git checkout выставляет ему время распаковки.
+        trained_at=(metrics or {}).get('trained_at')
+                   or _iso(model_path.stat().st_mtime),
         loaded_at=_iso(time.time()),
         late_model=late_model,
         late_version=late_version,
@@ -394,7 +397,7 @@ def create_app(model_path: str | Path | None = None,
             'loss': m.get('loss'),
             'features': state.features,
             'feature_count': len(state.features),
-            'trained_at': state.trained_at,  # mtime артефакта: метрики даты не хранят
+            'trained_at': state.trained_at,  # из metrics-json (mtime — лишь фолбэк)
             'loaded_at': state.loaded_at,
             'best_iteration': internal.get('best_iteration'),
             'mae': {k: v for k, v in m.items() if k.startswith('mae_')},

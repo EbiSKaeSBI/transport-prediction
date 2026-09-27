@@ -82,5 +82,6 @@
     "is_terminal_stop": 0.26137811704515806
   },
   "train_seconds": 1.9,
+  "trained_at": "2026-09-26T23:06:22+00:00",
   "model_beats_baseline_on_holdout": true
 }

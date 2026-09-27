@@ -34,6 +34,7 @@ CLI (от корня репозитория):
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sys
 import time
@@ -255,6 +256,10 @@ def train(
         **hint_diag,
         'feature_importances': {name: float(v) for name, v in importance},
         'train_seconds': round(time.monotonic() - t0, 1),
+        # Дата в метриках, а не mtime файла: git checkout переставляет mtime,
+        # и в свежем клоне /model/info врал бы «обучена сегодня».
+        'trained_at': datetime.datetime.now(datetime.timezone.utc)
+                      .isoformat(timespec='seconds'),
     }
     beats = metrics['mae_holdout_model'] < metrics['baseline_holdout']['mae_skip_nan']
     metrics['model_beats_baseline_on_holdout'] = bool(beats)
