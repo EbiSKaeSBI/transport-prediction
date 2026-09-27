@@ -46,7 +46,7 @@ ML_PORT ?= 8000
 .PHONY: help setup ml-setup build test lint fmt clean \
         dev attach stop status layout-install \
         serve dashboard emu-extract emu-up emu-config emu-down emu-logs \
-        emu-capture emu-plan emu-replan \
+        emu-capture emu-plan emu-replan replan-loop real-plan real-feed \
         submission audit ml-train ml-serve ml-predict-validate capture ml-datasets \
         ml-replay-frames ml-train-late
 
@@ -168,6 +168,13 @@ EMU_CAPTURE ?= $(ROOT)/.cache/emu-capture
 # повторов рейса в плане: расписание абсолютное, без повторов конвейер
 # через один рейс честно отказывает (no_target_in_horizon)
 EMU_REPEAT ?= 5
+
+# Живой контур по умолчанию — реальные данные датасета (train/): телеметрию
+# проигрывает dataset_feed, план берётся из настоящего schedule.csv.
+# Эмулятор (случайные кривые) остаётся для стресс-проверок: EMULATOR=1.
+REAL_DATASET ?= train
+REAL_UNITS ?= 4
+REAL_SPEED ?= 1
 EMU_SECONDS ?= 240
 
 emu-capture: ## снять EMU_SECONDS (240) телеметрии эмулятора в EMU_CAPTURE
@@ -194,6 +201,29 @@ emu-replan: ## пересобрать plan.csv/binding.csv по записи с�
 		--plan-out $(ROOT)/plan.csv --binding-out $(ROOT)/binding.csv \
 		--plan-repeat $(EMU_REPEAT)
 	@echo "план перезаписан; работающий сервер подхватит его за секунду (--plan-watch)"
+
+# Ездить по неписаной дороге план не умеет: экстраполяция по касательной в
+# position_at разъезжается с реальным поворотом за минуты, и ТС на карте
+# «сходит с маршрута». Пока сервер пишет capture непрерывно, цикл держит
+# план у головы записи — привязка не теряется между перегенерациями.
+REPLAN_EVERY ?= 60
+replan-loop: ## live-цикл для ЭМУЛЯТОРА (EMULATOR=1): перезабирать план каждые REPLAN_EVERY с
+	@echo "replan-цикл: каждые $(REPLAN_EVERY) с (Ctrl-C — остановить)"; \
+	while sleep $(REPLAN_EVERY); do $(MAKE) --no-print-directory emu-replan >/dev/null || true; done
+
+# --- реальный контур -------------------------------------------------------
+# dataset_feed играет train/ как есть: телеметрия из traffic.csv, план из
+# schedule.csv, синхронно на одной оси времени. Линии на дашборде — настоящие
+# маршруты, стабильные между перезагрузками; задержки — настоящие план-факт.
+
+real-plan: ## только собрать plan.csv/binding.csv из реального расписания $(REAL_DATASET)/
+	python3 scripts/dataset_feed.py --dataset-dir $(REAL_DATASET) --units $(REAL_UNITS) \
+		--plan-out $(ROOT)/plan.csv --binding-out $(ROOT)/binding.csv --generate-only
+
+real-feed: ## реальный контур: проиграть $(REAL_DATASET) (телеметрия + план) в NDTP-гейтвей
+	python3 scripts/dataset_feed.py --dataset-dir $(REAL_DATASET) --units $(REAL_UNITS) \
+		--speed $(REAL_SPEED) --plan-out $(ROOT)/plan.csv --binding-out $(ROOT)/binding.csv
+
 
 capture: ## принять 15 с телеметрии с эмулятора в EMU_CAPTURE
 	@mkdir -p $(EMU_CAPTURE)

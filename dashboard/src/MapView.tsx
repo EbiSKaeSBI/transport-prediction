@@ -7,22 +7,32 @@ import type { GeoJSONSource, ExpressionSpecification, StyleSpecification } from 
 import 'maplibre-gl/dist/maplibre-gl.css'
 import type { Store } from './store'
 import type { RouteFC, RouteGeom, Bounds } from './geo'
-import { routesBounds, routeGeometries, mergeBounds, pointsBounds, graticuleFC, niceStep } from './geo'
+import { routesBounds, routeGeometries, mergeBounds, pointsBounds, graticuleFC, niceStep, snapVehicle } from './geo'
 import { RISK_COLORS, vehicleRisk, riskSegmentsFC } from './risk'
 import type { VehicleState } from './types'
 
-function vehiclesFC(vehicles: Iterable<VehicleState>, clock: number, selected: number | null) {
+function vehiclesFC(
+  vehicles: Iterable<VehicleState>, clock: number, selected: number | null,
+  geoms: RouteGeom[],
+) {
   return {
     type: 'FeatureCollection' as const,
-    features: Array.from(vehicles, (v) => ({
-      type: 'Feature' as const,
-      properties: {
-        tr_id: v.tr_id,
-        risk: vehicleRisk(v, clock),
-        selected: v.tr_id === selected ? 1 : 0,
-      },
-      geometry: { type: 'Point' as const, coordinates: [v.lon, v.lat] },
-    })),
+    features: Array.from(vehicles, (v) => {
+      // точка на карте прижата к плану её маршрута (geo.snapVehicle):
+      // сырой GPS шумит рядом с хордой остановок, и без прижимания демон
+      // выглядит так, будто транспорт сошёл с маршрута
+      const pos = snapVehicle(v, geoms)
+      return {
+        type: 'Feature' as const,
+        properties: {
+          tr_id: v.tr_id,
+          risk: vehicleRisk(v, clock),
+          selected: v.tr_id === selected ? 1 : 0,
+          off_route: pos.snapped ? 0 : 1,
+        },
+        geometry: { type: 'Point' as const, coordinates: [pos.lon, pos.lat] },
+      }
+    }),
   }
 }
 
@@ -86,6 +96,16 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
   const onSelectRef = useRef(onSelect)
   useEffect(() => { selectedRef.current = selected }, [selected])
   useEffect(() => { onSelectRef.current = onSelect }, [onSelect])
+  // План приходит и перезагружается (App раз в минуту) независимо от карты:
+  // maplibre-экземпляр живёт от монтирования, а свежий план вливается setData
+  // через refreshRef. Пересоздание карты на каждую перезагрузку плана сбрасывало
+  // бы операторский зум и перемонтировало WebGL-контекст.
+  const routesRef = useRef<RouteFC | null>(routes)
+  const refreshRef = useRef<((fc: RouteFC | null) => void) | null>(null)
+  useEffect(() => {
+    routesRef.current = routes
+    refreshRef.current?.(routes)
+  }, [routes])
 
   useEffect(() => {
     if (!holder.current) return
@@ -94,6 +114,7 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       attributionControl: false,
       style: OFFLINE_STYLE,
     })
+    if (import.meta.env.DEV) (window as unknown as Record<string, unknown>).__map = map
     map.addControl(new NavigationControl({ showCompass: false }), 'top-left')
 
     let geoms: RouteGeom[] = []
@@ -107,7 +128,7 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
     const fitOnce = () => {
       if (fitted) return
       const pts = pointsBounds(store.vehicles.values())
-      const plan = routesBounds(routes)
+      const plan = routesBounds(routesRef.current)
       if (plan && !pts) return
       const b = mergeBounds(plan, pts)
       if (!b) return
@@ -133,12 +154,13 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
     }
 
     const install = () => {
-      geoms = routeGeometries(routes)
+      const fc = routesRef.current
+      geoms = routeGeometries(fc)
       for (const id of LAYERS) if (map.getLayer(id)) map.removeLayer(id)
       for (const id of SOURCES) if (map.getSource(id)) map.removeSource(id)
       map.addSource('ndtp-grid', { type: 'geojson', data: EMPTY as never })
-      map.addSource('ndtp-routes', { type: 'geojson', data: (routes ?? EMPTY) as never })
-      map.addSource('ndtp-vehicles', { type: 'geojson', data: vehiclesFC([], 0, null) as never })
+      map.addSource('ndtp-routes', { type: 'geojson', data: (fc ?? EMPTY) as never })
+      map.addSource('ndtp-vehicles', { type: 'geojson', data: vehiclesFC([], 0, null, geoms) as never })
       map.addSource('ndtp-risk-segs', { type: 'geojson', data: riskSegmentsFC(geoms, [], 0) as never })
       // сетка — под линиями плана: это фон, а не данные
       map.addLayer({
@@ -207,7 +229,7 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       raf = requestAnimationFrame(() => {
         raf = 0
         const src = map.getSource('ndtp-vehicles') as GeoJSONSource | undefined
-        src?.setData(vehiclesFC(store.vehicles.values(), store.clock, selectedRef.current) as never)
+        src?.setData(vehiclesFC(store.vehicles.values(), store.clock, selectedRef.current, geoms) as never)
         const segs = map.getSource('ndtp-risk-segs') as GeoJSONSource | undefined
         segs?.setData(riskSegmentsFC(geoms, store.vehicles.values(), store.clock) as never)
         fitOnce() // позиция могла приехать позже, чем стиль прогрузился
@@ -215,6 +237,17 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
     }
     redrawRef.current = redraw
     const unsub = store.subscribe(redraw)
+    // Свежий план вливается без пересоздания карты (цикл перезагрузки в App).
+    // Источник ещё не добавлен (стиль не допрогрузился) — setData пропускаем:
+    // install() сам подтянет routesRef.current.
+    refreshRef.current = (fc) => {
+      const src = map.getSource('ndtp-routes') as GeoJSONSource | undefined
+      if (!src) return
+      src.setData((fc ?? EMPTY) as never)
+      geoms = routeGeometries(fc)
+      redraw()
+      fitOnce()
+    }
     redraw()
 
     void probeOnlineStyle().then((url) => {
@@ -225,10 +258,11 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       disposed = true
       if (raf) cancelAnimationFrame(raf)
       if (redrawRef.current === redraw) redrawRef.current = () => {}
+      if (refreshRef.current) refreshRef.current = null
       unsub()
       map.remove()
     }
-  }, [store, routes])
+  }, [store])
 
   // смена выделения на паузе реплея: событий нет — перерисовать вручную
   const redrawRef = useRef<() => void>(() => {})

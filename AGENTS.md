@@ -1,7 +1,7 @@
 ### Управление проектом
 
 Для работы с проектом используй `Makefile` в корне (`make help` — список целей):
-- `make dev` — рабочий сеанс Zellij (шаблон лейаута `.zellij/tpredict.kdl.in`, `make layout-install` рендерит его с путём текущего клона в `~/.config/zellij/layouts/`): вкладка «поток» поднимает backend (NDTP :9201), дашборд (Vite :5173) и эмулятор; рядом — shell/git/docker/ai-пейны (все с fallback, если TUI нет). `make status` / `make attach` / `make stop` — управление им.
+- `make dev` — рабочий сеанс Zellij (шаблон лейаута `.zellij/tpredict.kdl.in`, `make layout-install` рендерит его с путём текущего клона в `~/.config/zellij/layouts/`): вкладка «поток» поднимает backend (NDTP :9201), дашборд (Vite :5173) и реальный фид (`scripts/dataset_feed.py` — проигрывает `train/traffic.csv`, план из `train/schedule.csv`); рядом — shell/git/docker/ai-пейны (все с fallback, если TUI нет). Эмулятор (случайные кривые, для стресс-проверок) — `EMULATOR=1 make dev` или `make emu-up`; для его плана тогда нужен `make replan-loop`. `make status` / `make attach` / `make stop` — управление им.
 - `make build|test|lint|fmt` — Go (`backend/`) + дашборд (`dashboard/`) + pytest (`tests/`).
 - `make serve|dashboard|emu-up|emu-config|emu-down` — сервисы по отдельности без Zellij.
 - `make submission|audit` — пайплайн датасета (`scripts/`).
