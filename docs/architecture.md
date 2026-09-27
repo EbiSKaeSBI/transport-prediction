@@ -86,8 +86,8 @@ README утверждает, что baseline даёт ≈ 0.40 — это **не
 | Внутренний RPC | HTTP + JSON, `ml.proto` как каноническая схема | контракт без кодогенерации, см. ADR 0002 |
 | In-memory состояние | кольцевые буферы на ТС, шардинг по `unitId` | горячий путь без обращения к БД |
 | Хранилище | в памяти: кольцевые буферы накопителя и гейтвея | без базы в критическом пути, см. ADR 0003 и ADR 0008 |
-| **ML-модуль** | **Python 3.12** (управляется `uv`), CatBoost + PyTorch, polars | прямо названо в ТЗ; polars — потому что pandas нет и 288k строк читаются мгновенно |
-| ML-сервис | FastAPI + uvicorn, ONNX Runtime (опционально) | < 1 с, батчи, авто-OpenAPI |
+| **ML-модуль** | **Python 3.12** (управляется `uv`), CatBoost (регрессор + отдельный классификатор P(late)), polars | прямо названо в ТЗ; polars — потому что pandas нет и 288k строк читаются мгновенно. PyTorch/ONNX из initial-схемы не реализованы и в стек не входят (v5, см. дорожную карту ниже) |
+| ML-сервис | FastAPI + uvicorn | < 1 с, батчи, авто-OpenAPI |
 | **Дашборд** | TypeScript + React + Vite + **MapLibre GL JS** + ECharts | MapLibre не требует API-ключа, стиль вендорится в образ |
 | Шина событий | in-process Go hub (broadcast в WebSocket) | деплой одного инстанса → нет лишней точки отказа |
 | Оркестрация | Docker Compose, multi-stage, healthcheck + `depends_on` | «запуск по одной инструкции» (критерий 3) |
@@ -202,15 +202,15 @@ Golden-тест (планируется): офлайн-выгрузка на `tr
 │  ③ Python · ML Core :8000        │         │  ④ Go · API Gateway :8080                 │
 │  POST /predict, /predict/batch    │◀────────│  • REST + встроенный OpenAPI + Swagger UI  │
 │  CatBoost (MAE) + P(late) head    │  HTTP   │  • WebSocket /ws/stream → дашборд         │
-│  PyTorch temporal encoder (opt)   │  + JSON │  • /metrics Prometheus                    │
+│  inference CPU, queue+batching    │  + JSON │  • /metrics Prometheus                    │
 │  единая features() train/serve    │         │  • circuit breaker + режим деградации     │
 └──────────┬───────────────────────┘         └──────────────┬───────────────────────────┘
            │ parquet + model artifact                      │
            ▼                                              ▼
     ┌───────────────┐                       ┌──────────────────────────────────────┐
     │ Train pipeline │                       │  ⑤ Dashboard (React / MapLibre) :3000 │
-    │ polars →       │                       │  карта · риск · карточки · what-if    │
-    │ CatBoost → ONNX│                      └──────────────────────────────────────┘
+    │ polars →       │                       │  карта · риск · карточки · live-панели│
+    │ CatBoost → json│                      └──────────────────────────────────────┘
     └───────┬───────┘
             │
      ┌──────┴───────┐
@@ -530,7 +530,7 @@ queueing-модели по цепочке остановок маршрута �
 | 3. 3 модуля + Docker | 0–6 | отдельные образы `gateway` / `ml-core` / `dashboard`, Go ↔ Python по HTTP+JSON, парсер NDTP, три производных признака, end-to-end тест |
 | 4. Дашборд | 0–6 | карта с полилиниями и живыми ТС, три цвета риска, карточка инцидента, live по WS |
 | 5. Производительность/надёжность | 0–4 | p50/p95/p99 в UI, circuit breaker, staleness TTL, авто-фолбэк на CSV-replay, восстановление после реконнекта, healthcheck'и, предсказуемый холодный старт |
-| Доп. фичи | — | map matching с учётом NDTP, what-if, ONNX, ансамбль |
+| Доп. фичи | — | реализовано: map matching с учётом NDTP, ансамбль регрессор+классификатор (прогноз + P(late) + причина); не реализовано: what-if, ONNX, ансамбль с PyTorch |
 | Питч | 0–10 | демо на эмуляторе, прозрачный доклад об утечке в данных, честные метрики, воспроизводимый запуск |
 
 ---
