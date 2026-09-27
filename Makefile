@@ -49,7 +49,7 @@ ML_PORT ?= 8000
         emu-capture emu-plan emu-replan replan-loop real-plan real-feed \
         submission audit ml-train ml-serve ml-predict-validate capture ml-datasets \
         ml-replay-frames ml-train-late \
-        docker-up docker-feed docker-down docker-logs
+        docker-up docker-feed docker-down docker-logs docs docs-serve
 
 help: ## показать список целей
 	@echo "transport-prediction — доступные команды:"
@@ -171,6 +171,13 @@ docker-down: ## снять docker-контур (том с планом оста�
 
 docker-logs: ## свежие логи docker-контура
 	docker compose --profile feed logs --tail 30
+
+docs: ## собрать Sphinx-документацию ML-модуля (docs/sphinx/build/html)
+	ml/.venv/bin/sphinx-build -b html docs/sphinx/source docs/sphinx/build/html
+
+docs-serve: ## собрать и раздать документацию на http://localhost:8090
+	$(MAKE) docs
+	cd docs/sphinx/build/html && python3 -m http.server 8090
 
 emu-logs: ## показать лог эмулятора
 	@tail -n 50 $(ROOT)/.cache/ndtp-emu/emu.log 2>/dev/null || echo "лога нет — сначала make emu-up"

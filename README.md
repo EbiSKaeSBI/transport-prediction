@@ -89,3 +89,7 @@ make submission -- --model ml/artifacts/predictions_validate.csv`
 ML), `make help` — остальные цели (`build`, `test`, `lint`, `real-plan`,
 `real-feed`, `ml-*`). Документация по устройству: `docs/how-it-works.md`,
 решения — `docs/adr/`, соответствие ТЗ — `docs/tz-conformance.md`.
+PyDoc по ML-коду (Sphinx/autodoc): `make docs` — HTML в
+`docs/sphinx/build/html`, `make docs-serve` — то же на
+http://localhost:8090 (нужен `ml/.venv` с зависимостями ML: `make ml-setup`).
+REST-контракт: Swagger UI `:8080/swagger`, OpenAPI — `:8080/openapi.yaml`.

@@ -136,3 +136,6 @@ desktop.ini
 #                          Vite-скелет: без них `npm run build` не соберётся
 plan.csv
 binding.csv
+
+# Sphinx build artifacts
+docs/sphinx/build/
