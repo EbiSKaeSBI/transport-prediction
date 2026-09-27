@@ -48,7 +48,8 @@ ML_PORT ?= 8000
         serve dashboard emu-extract emu-up emu-config emu-down emu-logs \
         emu-capture emu-plan emu-replan replan-loop real-plan real-feed \
         submission audit ml-train ml-serve ml-predict-validate capture ml-datasets \
-        ml-replay-frames ml-train-late
+        ml-replay-frames ml-train-late \
+        docker-up docker-feed docker-down docker-logs
 
 help: ## показать список целей
 	@echo "transport-prediction — доступные команды:"
@@ -158,6 +159,18 @@ emu-config: ## залить конфиг юнитов на поднятый эм
 
 emu-down: ## остановить эмулятор
 	python3 scripts/emu_native.py stop
+
+docker-up: ## поднять весь контур в Docker (мл+бэкенд+дашборд, http://localhost:8088)
+	docker compose up -d --build
+
+docker-feed: ## то же + плеер real-датасета train/ в контур
+	docker compose --profile feed up -d --build
+
+docker-down: ## снять docker-контур (том с планом остаётся: -v — удалить)
+	docker compose --profile feed down
+
+docker-logs: ## свежие логи docker-контура
+	docker compose --profile feed logs --tail 30
 
 emu-logs: ## показать лог эмулятора
 	@tail -n 50 $(ROOT)/.cache/ndtp-emu/emu.log 2>/dev/null || echo "лога нет — сначала make emu-up"

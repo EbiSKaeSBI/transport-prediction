@@ -1,0 +1,7 @@
+.venv
+__pycache__
+artifacts/dataset_*.parquet
+artifacts/features_*.jsonl
+artifacts/predictions_*.csv
+catboost_info
+tests
