@@ -1,14 +1,16 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 // первым импортом — модуль с URL воркера: без него карта не поднимется ни в
 // dev, ни в собранном dist (см. ./maplibregl.ts)
 import './maplibregl'
-import { Map, NavigationControl } from 'maplibre-gl'
+import { AttributionControl, Map, NavigationControl } from 'maplibre-gl'
 import type { GeoJSONSource, ExpressionSpecification, StyleSpecification } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
+import YMapView from './YMapView'
+import { loadYmaps, ymapsApiKey, type YMaps3 } from './ymaps'
 import type { Store } from './store'
 import type { RouteFC, RouteGeom, Bounds } from './geo'
 import { routesBounds, routeGeometries, mergeBounds, pointsBounds, graticuleFC, niceStep } from './geo'
-import { RISK_COLORS, vehicleRisk, riskSegmentsFC } from './risk'
+import { RISK_COLORS, vehicleRisk, riskSegmentsFC, traveledRoutesFC } from './risk'
 import type { VehicleState } from './types'
 
 function vehiclesFC(vehicles: Iterable<VehicleState>, clock: number, selected: number | null) {
@@ -47,6 +49,41 @@ const OFFLINE_STYLE: StyleSpecification = {
   layers: [{ id: 'bg', type: 'background', paint: { 'background-color': '#101418' } }],
 }
 
+// Датасет и план-графики — Москва (37.6173, 55.7558): до прихода плана и
+// телеметрии камера показывает город, а не «нулевой остров» у экватора.
+const MOSCOW_CENTER: [number, number] = [37.6173, 55.7558]
+
+// Настоящая подложка по умолчанию: растровые тайлы CARTO dark — совпадают с
+// тёмной темой дашборда, данные © OpenStreetMap. Свой style.json (со своими
+// тайлами и подписями) по-прежнему приоритетнее: VITE_MAP_STYLE ниже.
+const CARTO_TILES = ['a', 'b', 'c', 'd'].map(
+  (s) => `https://${s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png`,
+)
+
+function moscowBasemap(): StyleSpecification {
+  return {
+    version: 8,
+    sources: {
+      'ndtp-basemap': {
+        type: 'raster',
+        tiles: CARTO_TILES,
+        tileSize: 256,
+        maxzoom: 20,
+        attribution: '© OpenStreetMap contributors © CARTO',
+      },
+    },
+    layers: [
+      // фон под тайлами: где тайл ещё не доехал — цвет дашборда, а не белый
+      { id: 'bg', type: 'background', paint: { 'background-color': '#101418' } },
+      { id: 'ndtp-basemap-tiles', type: 'raster', source: 'ndtp-basemap' },
+    ],
+  }
+}
+
+// Проба «есть ли сеть вообще» — один тайл над Москвой (z=11): недоступен —
+// остаёмся на офлайн-стиле с сеткой координат.
+const MOSCOW_TILE_PROBE = 'https://a.basemaps.cartocdn.com/dark_all/11/1238/640.png'
+
 /**
  * VITE_MAP_STYLE — необязательная настоящая подложка: style.json с тайлами и
  * подписями. Пусто, недоступно или не отдаёт 200 — остаёмся на офлайн-стиле,
@@ -54,12 +91,21 @@ const OFFLINE_STYLE: StyleSpecification = {
  * подстановки стиля: у maplibre нет асинхронного фолбэка, а setStyle на
  * несуществующий URL оставляет карту навсегда пустой.
  */
-async function probeOnlineStyle(): Promise<string | null> {
+async function probeOnlineStyle(): Promise<string | StyleSpecification | null> {
   const url = import.meta.env.VITE_MAP_STYLE
-  if (!url) return null
+  if (url) {
+    try {
+      const res = await fetch(url)
+      return res.ok ? url : null
+    } catch {
+      return null
+    }
+  }
+  // Явного стиля нет — проба одного тайла решает «есть ли сеть вообще»:
+  // недоступен — остаёмся на офлайн-сетке (docs/architecture.md §6).
   try {
-    const res = await fetch(url)
-    return res.ok ? url : null
+    const res = await fetch(MOSCOW_TILE_PROBE)
+    return res.ok ? moscowBasemap() : null
   } catch {
     return null
   }
@@ -67,9 +113,9 @@ async function probeOnlineStyle(): Promise<string | null> {
 
 // Идентификаторы с префиксом: подложка извне может принести свои слои с
 // любыми именами, и install() не должен сносить чужие.
-const SOURCES = ['ndtp-grid', 'ndtp-routes', 'ndtp-vehicles', 'ndtp-risk-segs'] as const
+const SOURCES = ['ndtp-grid', 'ndtp-routes', 'ndtp-vehicles', 'ndtp-risk-segs', 'ndtp-traveled'] as const
 const LAYERS = [
-  'ndtp-grid-line', 'ndtp-routes-line', 'ndtp-risk-seg-line',
+  'ndtp-grid-line', 'ndtp-routes-line', 'ndtp-traveled-line', 'ndtp-risk-seg-line',
   'ndtp-stops-dot', 'ndtp-vehicles-halo', 'ndtp-vehicles-dot',
 ] as const
 
@@ -80,7 +126,7 @@ interface Props {
   onSelect: (trId: number | null) => void
 }
 
-export default function MapView({ store, routes, selected, onSelect }: Props) {
+function MapLibreView({ store, routes, selected, onSelect }: Props) {
   const holder = useRef<HTMLDivElement | null>(null)
   const selectedRef = useRef<number | null>(selected)
   const onSelectRef = useRef(onSelect)
@@ -93,11 +139,19 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       container: holder.current,
       attributionControl: false,
       style: OFFLINE_STYLE,
+      center: MOSCOW_CENTER,
+      zoom: 11,
     })
     map.addControl(new NavigationControl({ showCompass: false }), 'top-left')
+    // dev-only хук: браузерные проверки и отладка читают состояние слоёв
+    // (const в прод-сборке вырезается вместе с условием import.meta.env.DEV)
+    if (import.meta.env.DEV) (window as unknown as { __ndtpMap?: Map }).__ndtpMap = map
 
     let geoms: RouteGeom[] = []
     let disposed = false
+    // Настоящая подложка (город, улицы, подписи) активна — сетка координат
+    // тогда лишняя: она была офлайн-заменителем карты, а не декорацией поверх.
+    let baseOnline = false
 
     // Рамка — один раз, когда известны и план, и позиция ТС. План без машин
     // игнорируем: план демо-фида лежит в 8 км от телеметрии, рамка только по
@@ -136,19 +190,33 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       geoms = routeGeometries(routes)
       for (const id of LAYERS) if (map.getLayer(id)) map.removeLayer(id)
       for (const id of SOURCES) if (map.getSource(id)) map.removeSource(id)
-      map.addSource('ndtp-grid', { type: 'geojson', data: EMPTY as never })
       map.addSource('ndtp-routes', { type: 'geojson', data: (routes ?? EMPTY) as never })
       map.addSource('ndtp-vehicles', { type: 'geojson', data: vehiclesFC([], 0, null) as never })
       map.addSource('ndtp-risk-segs', { type: 'geojson', data: riskSegmentsFC(geoms, [], 0) as never })
-      // сетка — под линиями плана: это фон, а не данные
-      map.addLayer({
-        id: 'ndtp-grid-line', type: 'line', source: 'ndtp-grid',
-        paint: { 'line-color': '#1b242c', 'line-width': 1 },
-      } as never)
+      map.addSource('ndtp-traveled', { type: 'geojson', data: traveledRoutesFC([], [], 0) as never })
+      // сетка — под линиями плана: это фон, а не данные; с реальной подложкой
+      // её не рисуем вовсе
+      if (!baseOnline) {
+        map.addSource('ndtp-grid', { type: 'geojson', data: EMPTY as never })
+        map.addLayer({
+          id: 'ndtp-grid-line', type: 'line', source: 'ndtp-grid',
+          paint: { 'line-color': '#1b242c', 'line-width': 1 },
+        } as never)
+      }
       map.addLayer({
         id: 'ndtp-routes-line', type: 'line', source: 'ndtp-routes',
         filter: ['==', ['get', 'kind'], 'route'],
         paint: { 'line-color': ['get', 'color'] as never, 'line-width': 2, 'line-opacity': 0.8 },
+      } as never)
+      // пройденная часть маршрута: тон вдоль плана за машиной, в цвете её
+      // риска — при опасности хвост желтеет/краснеет целиком (риск.ts)
+      map.addLayer({
+        id: 'ndtp-traveled-line', type: 'line', source: 'ndtp-traveled',
+        layout: { 'line-cap': 'round', 'line-join': 'round' } as never,
+        paint: {
+          'line-color': riskColorExpr as never,
+          'line-width': 3.5, 'line-opacity': 0.85,
+        },
       } as never)
       // участки риска поверх линий плана, под точками остановок: диспетчеру
       // важно, какой участок маршрута горит, а не только где машина.
@@ -210,6 +278,8 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
         src?.setData(vehiclesFC(store.vehicles.values(), store.clock, selectedRef.current) as never)
         const segs = map.getSource('ndtp-risk-segs') as GeoJSONSource | undefined
         segs?.setData(riskSegmentsFC(geoms, store.vehicles.values(), store.clock) as never)
+        const traveled = map.getSource('ndtp-traveled') as GeoJSONSource | undefined
+        traveled?.setData(traveledRoutesFC(geoms, store.vehicles.values(), store.clock) as never)
         fitOnce() // позиция могла приехать позже, чем стиль прогрузился
       })
     }
@@ -217,8 +287,15 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
     const unsub = store.subscribe(redraw)
     redraw()
 
-    void probeOnlineStyle().then((url) => {
-      if (url && !disposed) map.setStyle(url)
+    void probeOnlineStyle().then((style) => {
+      if (!style || disposed) return
+      // сначала флаг: style.load сработает синхронно из setStyle, install()
+      // обязан увидеть онлайн-подложку и не рисовать сетку
+      baseOnline = true
+      map.setStyle(style)
+      // атрибуция нужна только настоящей подложке (требование OSM/CARTO);
+      // на офлайн-сетке показывать нечего
+      map.addControl(new AttributionControl({ compact: true }), 'bottom-right')
     })
 
     return () => {
@@ -226,6 +303,9 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
       if (raf) cancelAnimationFrame(raf)
       if (redrawRef.current === redraw) redrawRef.current = () => {}
       unsub()
+      if (import.meta.env.DEV && (window as unknown as { __ndtpMap?: Map }).__ndtpMap === map) {
+        delete (window as unknown as { __ndtpMap?: Map }).__ndtpMap
+      }
       map.remove()
     }
   }, [store, routes])
@@ -235,4 +315,34 @@ export default function MapView({ store, routes, selected, onSelect }: Props) {
   useEffect(() => { redrawRef.current() }, [selected])
 
   return <div ref={holder} className="map-holder" />
+}
+
+/**
+ * Точка входа карты: при валидном VITE_YANDEX_MAPS_API_KEY — Яндекс JS API
+ * (тёмная схема с кастомизацией, §docs customization), иначе — офлайн-движок
+ * MapLibre. Загрузка Яндекса асинхронная: битый ключ, отсутствие сети или
+ * неподтверждённый реферер не роняют дашборд — тихо откатываемся на MapLibre
+ * (одно warning в консоль) и живём с подложкой/сеткой как раньше.
+ */
+export default function MapView(props: Props) {
+  const [engine, setEngine] = useState<'pending' | 'yandex' | 'libre'>(
+    () => (ymapsApiKey() ? 'pending' : 'libre'),
+  )
+  const [api, setApi] = useState<YMaps3 | null>(null)
+  useEffect(() => {
+    if (engine !== 'pending') return
+    let alive = true
+    loadYmaps().then(
+      (a) => { if (alive) { setApi(a); setEngine('yandex') } },
+      (err: Error) => {
+        if (!alive) return
+        console.warn(`[ndtp] ${err.message}; карта на офлайн-движке MapLibre`)
+        setEngine('libre')
+      },
+    )
+    return () => { alive = false }
+  }, [engine])
+  if (engine === 'yandex' && api) return <YMapView api={api} {...props} />
+  if (engine === 'pending') return <div className="map-holder" />
+  return <MapLibreView {...props} />
 }

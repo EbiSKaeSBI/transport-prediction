@@ -203,3 +203,30 @@ export function nearestSegment(
   }
   return best
 }
+
+/**
+ * Пройденная часть полилинии: от начала маршрута до проекции точки ТС на
+ * ближайшее звено. Метрика плоская, как в nearestSegment, а она линейна по
+ * градусам (cos широты — константа в пределах маршрута), поэтому параметр
+ * t из метрического проекта переносит точку на отрезке в градусы без пересчёта.
+ * null — точка дальше звена, чем tol_m: машина не на этом маршруте, и
+ * «пройденного» по нему показывать нельзя.
+ */
+export function traveledPath(
+  coords: [number, number][], lon: number, lat: number, tol_m: number,
+): [number, number][] | null {
+  if (coords.length < 2) return null
+  const { idx, dist_m } = nearestSegment(coords, lon, lat)
+  if (dist_m > tol_m) return null
+  const [ax, ay] = coords[idx]
+  const [bx, by] = coords[idx + 1]
+  const cos = Math.cos((lat * Math.PI) / 180)
+  const m = M_PER_DEG * cos
+  const px = lon * m, py = lat * M_PER_DEG
+  const axm = ax * m, aym = ay * M_PER_DEG
+  const dx = bx * m - axm, dy = by * M_PER_DEG - aym
+  const l2 = dx * dx + dy * dy
+  const t = l2 > 0 ? Math.max(0, Math.min(1, ((px - axm) * dx + (py - aym) * dy) / l2)) : 0
+  const proj: [number, number] = [ax + (bx - ax) * t, ay + (by - ay) * t]
+  return [...coords.slice(0, idx + 1), proj]
+}

@@ -5,4 +5,4 @@
 export { WireAdapter } from '../src/wire'
 export { WsSource } from '../src/source'
 export { Store } from '../src/store'
-export { vehicleRisk, RISK_COLORS } from '../src/risk'
+export { vehicleRisk, RISK_COLORS, traveledRoutesFC } from '../src/risk'

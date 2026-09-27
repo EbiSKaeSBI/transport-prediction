@@ -1,4 +1,4 @@
-import { nearestSegment, type RouteGeom } from './geo'
+import { nearestSegment, traveledPath, type RouteGeom } from './geo'
 import type { Risk, VehicleState } from './types'
 
 // Риск до подключения модели — задокументированное правило-фолбэк
@@ -91,4 +91,42 @@ export function riskSegmentsFC(
       geometry: { type: 'LineString' as const, coordinates: r.seg },
     })),
   }
+}
+
+/**
+ * traveledRoutesFC — пройденная часть маршрута каждой машины: линия вдоль
+ * плана от начальной остановки до проекции текущего положения ТС. Цвет —
+ * риск машины (та же легенда, что у точки и участка): при опасности весь
+ * пройденный хвост желтеет/краснеет, и диспетчер видит, насколько далеко
+ * уехала уже проблемная машина. Сопоставление машины с полилинией — то же,
+ * что в riskSegmentsFC (по tr_id, допуск ON_ROUTE_TOLERANCE_M): машина не на
+ * маршруте — пройденного по нему не показываем.
+ */
+export function traveledRoutesFC(
+  geoms: RouteGeom[], vehicles: Iterable<VehicleState>, clock: number,
+): {
+  type: 'FeatureCollection'
+  features: { type: 'Feature'; properties: { kind: string; tr_id: number; risk: Risk }; geometry: { type: 'LineString'; coordinates: [number, number][] } }[]
+} {
+  const features: ReturnType<typeof traveledRoutesFC>['features'] = []
+  for (const v of vehicles) {
+    if (!Number.isFinite(v.lon) || !Number.isFinite(v.lat)) continue
+    let best: { g: RouteGeom; idx: number; dist_m: number } | null = null
+    for (const g of geoms) {
+      if (g.tr_id !== 0 && v.tr_id !== 0 && g.tr_id !== v.tr_id) continue
+      const p = nearestSegment(g.coords, v.lon, v.lat)
+      if (p.dist_m <= ON_ROUTE_TOLERANCE_M && (best === null || p.dist_m < best.dist_m)) {
+        best = { g, ...p }
+      }
+    }
+    if (!best) continue
+    const path = traveledPath(best.g.coords, v.lon, v.lat, ON_ROUTE_TOLERANCE_M)
+    if (!path || path.length < 2) continue
+    features.push({
+      type: 'Feature',
+      properties: { kind: 'traveled', tr_id: v.tr_id, risk: vehicleRisk(v, clock) },
+      geometry: { type: 'LineString', coordinates: path },
+    })
+  }
+  return { type: 'FeatureCollection', features }
 }

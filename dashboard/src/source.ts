@@ -124,6 +124,7 @@ export class WsSource implements DataSource {
   private closed = false
   private retry = 0
   private timer: ReturnType<typeof setTimeout> | null = null
+  private clockTimer: ReturnType<typeof setInterval> | null = null
 
   private store: Store
   private url: string
@@ -149,8 +150,28 @@ export class WsSource implements DataSource {
     this.closed = true
     if (this.timer != null) clearTimeout(this.timer)
     this.timer = null
+    this.stopWallClock()
     this.ws?.close()
     this.ws = null
+  }
+
+  /**
+   * Часы живой ленты: store.clock двигают только события, а gateway рассылает
+   * карточки по сетке --grid (5 с) — без этого секунды на часах скачут
+   * пятисекундными шагами (02:09:54 → 02:09:59 → 02:10:05). Тикер берёт
+   * стенные часы Date.now()/1000: та же unix-ось, что у envelope `at`
+   * (RFC3339 с реальной зоной, см. wire.ts). tickClock монотонен: если часы
+   * gateway спешат, событие никогда не откатит дисплей назад.
+   */
+  private startWallClock(): void {
+    if (this.clockTimer != null) return
+    this.clockTimer = setInterval(() => this.store.tickClock(Date.now() / 1000), 500)
+  }
+
+  private stopWallClock(): void {
+    if (this.clockTimer == null) return
+    clearInterval(this.clockTimer)
+    this.clockTimer = null
   }
 
   private open(): void {
@@ -164,6 +185,7 @@ export class WsSource implements DataSource {
     this.ws = ws
     ws.onopen = () => {
       this.retry = 0
+      this.startWallClock()
       this.status('open')
       this.fetchPassport()
     }
@@ -179,6 +201,8 @@ export class WsSource implements DataSource {
     }
     ws.onclose = (ev?: { code?: number; reason?: string }) => {
       if (this.closed) return
+      // ленты нет — часы от событий не придут, но стенные-то идут: тикер
+      // оставляем, stale-детекция обязана стареть и на перерыве связи
       const delay = Math.min(30000, 500 * 2 ** this.retry++)
       this.status('retry', `через ${delay} мс (попытка ${this.retry + 1}, код ${ev?.code ?? '?'})`)
       this.timer = setTimeout(() => { this.timer = null; this.open() }, delay)

@@ -7,7 +7,7 @@
 //   node scripts/build-adapter.mjs && node --test scripts/adapter.test.mjs
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { WireAdapter, Store, vehicleRisk } from './adapter.bundle.mjs'
+import { WireAdapter, Store, vehicleRisk, traveledRoutesFC } from './adapter.bundle.mjs'
 
 const AT = '2026-09-26T04:00:00+03:00'
 const AT_SAW = '2026-09-26T04:00:05.123+03:00'
@@ -236,4 +236,31 @@ test('edge: at без зоны («Go наивный MSK+Z»-ловушка) — 
   const { events } = a.decodeMessage(wire('vehicle_update',
     { ...card(), last_seen: '2026-01-06T08:00:00+03:00' }))
   assert.equal(events[0].ts, Date.UTC(2026, 0, 6, 5, 0, 0) / 1000)
+})
+
+test('traveledRoutesFC: хвост вдоль плана до проекции машины, цвет по риску', () => {
+  const geoms = [{ tr_id: 7, route: '7', coords: [[0, 0], [0.01, 0], [0.02, 0]] }]
+  const base = { tr_id: 7, lon: 0.005, lat: 0.0001, speed: 40, heading: 90,
+    ts: epoch(AT_SAW), lastFrame: null }
+  const clock = epoch(AT_SAW)
+
+  // машина прошла половину первого звена: хвост — начало до проекции,
+  // до следующей остановки плана не дотянут
+  const fc = traveledRoutesFC(geoms, [base], clock)
+  assert.equal(fc.features.length, 1)
+  const c = fc.features[0].geometry.coordinates
+  assert.equal(c.length, 2)
+  assert.deepEqual(c[0], [0, 0])
+  assert.ok(Math.abs(c[1][0] - 0.005) < 1e-9, `проекция по долготе: ${c[1][0]}`)
+  assert.equal(fc.features[0].properties.risk, 'unknown')
+
+  // классификация gateway задаёт цвет всего хвоста
+  const red = { ...base, lastFrame: { risk: 'red' } }
+  assert.equal(traveledRoutesFC(geoms, [red], clock).features[0].properties.risk, 'red')
+
+  // машина вне плана (>150 м) — пройденного не показываем
+  assert.equal(traveledRoutesFC(geoms, [{ ...base, lat: 0.01 }], clock).features.length, 0)
+
+  // чужой tr_id — хвост по соседнему маршруту не рисуем
+  assert.equal(traveledRoutesFC(geoms, [{ ...base, tr_id: 8 }], clock).features.length, 0)
 })
