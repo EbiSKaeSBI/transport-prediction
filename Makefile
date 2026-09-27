@@ -71,6 +71,9 @@ setup: ## установить зависимости (go, npm, эмулятор
 
 ml-setup: ## поднять python-окружение ML-ядра (uv, тяжёлые зависимости)
 	cd ml && uv sync
+	# именованные группы uv по умолчанию не ставит, а без docs-группы
+	# следующая же цель docs падает на отсутствующем sphinx-build
+	cd ml && uv sync --group docs
 
 clean: ## убрать артефакты сборки и кэши тестов
 	rm -f $(ROOT)/backend/transportctl $(ROOT)/observations.jsonl
